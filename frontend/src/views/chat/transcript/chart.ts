@@ -140,6 +140,26 @@ export function hasVolume(payload: ChartPayload): boolean {
   return payload.candles.some((candle) => typeof candle.volume === 'number')
 }
 
+/**
+ * Convert a `canvas.toDataURL()` result into a Blob for download.
+ *
+ * The data-URL is `data:image/png;base64,<payload>`. We strip the prefix,
+ * decode the base64 into a Uint8Array, and wrap it in a Blob — no fetch
+ * needed, no extra library.
+ */
+function dataURLtoBlob(dataUrl: string): Blob {
+  const comma = dataUrl.indexOf(',')
+  if (comma < 0) return new Blob([], { type: 'image/png' })
+  const header = dataUrl.slice(0, comma)
+  const encoded = dataUrl.slice(comma + 1)
+  const mimeMatch = header.match(/:(.*?);/)
+  const mime = mimeMatch?.[1] ?? 'image/png'
+  const binary = atob(encoded)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return new Blob([bytes], { type: mime })
+}
+
 /** One volume-histogram row per candle, colored by that candle's direction. */
 export function volumeSeriesData(
   payload: ChartPayload,
@@ -553,6 +573,36 @@ export function createChartMounter(deps: ChartMounterDeps) {
     }
     live.set(host, entry)
     setStatus(host, '')
+
+    // Export chart as PNG image instead of downloading the raw JSON artifact.
+    // The download <a> in artifacts.ts points at the artifact URL (JSON); we
+    // intercept the click here, capture the canvas, and trigger a PNG download.
+    const downloadLink = host.querySelector<HTMLAnchorElement>('.msg-artifact-chart__download')
+    if (downloadLink) {
+      downloadLink.addEventListener('click', (event: MouseEvent) => {
+        event.preventDefault()
+        const canvasEl = canvasHost.querySelector('canvas')
+        if (!canvasEl) return
+        try {
+          const dataUrl = canvasEl.toDataURL('image/png')
+          const blob = dataURLtoBlob(dataUrl)
+          const blobUrl = URL.createObjectURL(blob)
+          const link = document.createElement('a')
+          link.href = blobUrl
+          // Derive filename from the chart title or fall back to "chart".
+          const title = host.querySelector<HTMLElement>('.msg-artifact-chart__name')?.textContent
+          link.download = `${title || 'chart'}.png`
+          document.body.appendChild(link)
+          link.click()
+          document.body.removeChild(link)
+          URL.revokeObjectURL(blobUrl)
+        } catch {
+          // Canvas tainted or toDataURL unavailable — fall back to the
+          // original JSON download by doing nothing (the default <a> action
+          // would have handled it).
+        }
+      })
+    }
   }
 
   async function mountOne(host: HTMLElement): Promise<void> {
