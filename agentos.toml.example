@@ -524,6 +524,9 @@ security_grading = false
 # paths. Use `agentos sandbox on|bypass|full|reset` to update this together
 # with the sandbox section.
 default_mode = "bypass"                 # off | on | bypass | full
+# Default mode for cron agent_turn jobs. "bypass" runs elevated by default
+# (no approval, host shell). Use --no-elevated on individual jobs to opt out.
+cron_default_mode = "bypass"            # off | bypass | full
 
 # [auth]
 # mode = "none"         # none | token | password
