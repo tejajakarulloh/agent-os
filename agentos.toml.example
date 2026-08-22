@@ -7,8 +7,8 @@
 
 # Assistant speaker label shown on the ◢ marker, the pre-token waiting
 # row, and the queued-turn marker in `agentos chat`. Defaults to "agentos".
-# Env override: AGENTOS_ASSISTANT_LABEL="Hani"
-# assistant_label = "agentos"
+# NOTE: This is env-only, not a TOML key — set via AGENTOS_ASSISTANT_LABEL.
+# Example: AGENTOS_ASSISTANT_LABEL="Hani"
 
 # Workspace/state defaults
 # Defaults:
@@ -22,8 +22,8 @@
 # events while a run is active; stream idle timeout is the real upstream stall
 # detector. Keep browser grace above stream idle so server terminal errors win.
 # agent_stream_heartbeat_interval_seconds = 15.0
-# agent_stream_idle_timeout_seconds = 180.0
-# webui_stream_idle_grace_seconds = 210.0
+# agent_stream_idle_timeout_seconds = 600.0
+# webui_stream_idle_grace_seconds = 630.0
 # Keep a positive cap for smaller local models so repeated tool calls cannot
 # run forever. Zero means unlimited.
 # agent_max_iterations = 8
@@ -524,6 +524,23 @@ security_grading = false
 # paths. Use `agentos sandbox on|bypass|full|reset` to update this together
 # with the sandbox section.
 default_mode = "bypass"                 # off | on | bypass | full
+# Default mode for cron agent_turn jobs. "bypass" runs elevated by default
+# (no approval, host shell). Use --no-elevated on individual jobs to opt out.
+cron_default_mode = "bypass"            # off | bypass | full
+
+[safety]
+# Prompt-ingress safety controls.
+# wrap_untrusted_workspace isolates workspace files from prompt context.
+wrap_untrusted_workspace = true
+# injection_scan_mode: "off" disables, "report" warns, "enforce" blocks
+# suspected prompt-injection attempts.
+injection_scan_mode = "report"          # off | report | enforce
+
+[prompt_cache]
+# LLM prompt-cache mode. "auto" caches when the provider supports it;
+# "on" forces caching, "off" disables entirely.
+mode = "auto"                           # off | auto | on
+
 
 # [auth]
 # mode = "none"         # none | token | password

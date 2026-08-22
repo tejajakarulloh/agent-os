@@ -674,7 +674,7 @@ from a channel.
 ### Announcing to a specific channel
 
 `--announce --channel telegram --to <chat-id>` pins where a job reports, and
-`--account`, `--no-deliver`, `--best-effort`, and `--webhook-url` cover the rest.
+`--account`, `--no-deliver`, `--best-effort-deliver`, and `--webhook-url` cover the rest.
 The in-agent `cron` tool accepts the channel case too, through a `delivery`
 object — also restricted to an interactive CLI or Web caller, so a chat
 participant cannot redirect a job into a room they were never in. Webhook

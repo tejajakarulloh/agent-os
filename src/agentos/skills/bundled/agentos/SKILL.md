@@ -279,8 +279,8 @@ agentos gateway status --json  # machine-readable status
 agentos gateway stop
 ```
 
-Default port **18791**, loopback bind. `--listen HOST:PORT` overrides
-`--bind`/`--port` together. `gateway status` (and `--json`) reports **both**
+Default port **18791**, loopback bind. `--listen HOST` overrides `--bind`
+(host only; use `--port` separately for the port). `gateway status` (and `--json`) reports **both**
 the installed CLI version (`cliVersion`) and the running gateway's version
 (`gatewayVersion`); a `versionMismatch` diagnostic means the gateway is running
 old code — restart it.

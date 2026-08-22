@@ -33,6 +33,7 @@ root release README with task-oriented guides.
   authoring.
 - [`features/compaction-and-cache.md`](features/compaction-and-cache.md) -
   long-session compaction and prompt-cache continuity.
+- [`features/browser.md`](features/browser.md) - browser automation tool.
 
 ## Surfaces and Operations
 
