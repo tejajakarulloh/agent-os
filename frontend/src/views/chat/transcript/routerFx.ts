@@ -1001,6 +1001,14 @@ export function createRouterFxRenderer(deps: RouterFxRendererDeps) {
     }
   }
 
+  /** Pin-path sweep: current session only. Session switch uses clearRouterFxVisuals. */
+  function clearCurrentSessionStrips(): void {
+    const k = sessionKey()
+    strips().forEach((el) => {
+      if (!k || !el.dataset.sessionKey || el.dataset.sessionKey === k) removeStrip(el)
+    })
+  }
+
   function clearRouterFxVisuals(reason = ''): void {
     cancelPendingRouterFxScan(reason || 'clear_visuals')
     strips().forEach((el) => removeStrip(el))
@@ -1085,6 +1093,7 @@ export function createRouterFxRenderer(deps: RouterFxRendererDeps) {
       return false
     }
     if (isRoutePinned()) {
+      clearCurrentSessionStrips()
       diag('router_scan.schedule.skip.route_pinned', {})
       return false
     }
@@ -1137,6 +1146,7 @@ export function createRouterFxRenderer(deps: RouterFxRendererDeps) {
       return false
     }
     if (isRoutePinned()) {
+      clearCurrentSessionStrips()
       diag('router_scan.skip.route_pinned', {})
       return false
     }
@@ -1486,15 +1496,9 @@ export function createRouterFxRenderer(deps: RouterFxRendererDeps) {
       // tier that lends it settings (say c1) alongside the chosen model (say
       // glm-5.2), so learning it would rewrite c1's model in the registry and
       // mislabel later strips for a tier that never ran that model.
-      // Also sweep a live strip already on screen: the pin may have been set
-      // mid-turn, after the scan began.
-      if (thread()) {
-        strips('.router-fx[data-live="true"]').forEach((el) => {
-          if (!el.dataset.turnIndex || el.dataset.turnIndex === String(turnIndex)) {
-            removeStrip(el)
-          }
-        })
-      }
+      // Also sweep any active-session strip (live or settled from a previous turn)
+      // already on screen.
+      if (thread()) clearCurrentSessionStrips()
       diag('router_decision.skip.route_pinned', summarizePayload(payload))
       return
     }
@@ -1731,12 +1735,23 @@ export function createRouterFxRenderer(deps: RouterFxRendererDeps) {
    * chat.js:5751-5770 — run after the history owner marks hydration complete.
    * Pending replay decisions can now find a user anchor; stale/unstamped strips
    * are then pruned, with the visual preference acting as the final sweep.
+   *
+   * The dock is a receipt of the latest turn, not the latest eligible routing
+   * turn. A pinned (or otherwise non-routed) latest turn must not leave an
+   * older Auto strip on screen after reload.
    */
   function finishHistoryRouterFx(): void {
     flushPendingRouterDecisions()
     const currentSessionKey = sessionKey()
+    const latestTurn = String(countUserMessages())
     strips().forEach((el) => {
-      if (el.dataset.sessionKey === currentSessionKey && el.dataset.turnIndex) return
+      if (
+        el.dataset.sessionKey === currentSessionKey &&
+        el.dataset.turnIndex &&
+        (el.dataset.live === 'true' || el.dataset.turnIndex === latestTurn)
+      ) {
+        return
+      }
       removeStrip(el)
     })
     if (!pref.enabled) clearRouterFxVisuals('preference_disabled_history')

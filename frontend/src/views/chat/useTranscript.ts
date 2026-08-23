@@ -677,10 +677,14 @@ export function useTranscript(opts: {
     return () => thread.removeEventListener('click', onArtifactClick)
   }, [controller])
 
-  // Mirror the pin into the ref the router-fx renderer reads live.
+  // Mirror the pin into the ref the router-fx renderer reads live, and sweep
+  // any settled strip from a previous turn as soon as a pin is chosen.
   useEffect(() => {
     routePinnedRef.current = opts.routePinned === true
-  }, [opts.routePinned])
+    if (opts.routePinned) {
+      controller.clearRouterFxVisuals?.('route_pinned')
+    }
+  }, [controller, opts.routePinned])
 
   useEffect(() => {
     if (routerConfigQuery.isPending) return

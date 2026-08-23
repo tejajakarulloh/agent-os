@@ -259,6 +259,7 @@ function makeHistoryRenderer(
     pref,
     renderer,
     sessionKey,
+    thread,
     cleanup: () => {
       renderer.clearRouterFxVisuals()
       host.remove()
@@ -513,6 +514,129 @@ describe('createRouterFxRenderer route-pin suppression', () => {
     }
   })
 
+  it('clears an existing settled strip for the current session when scheduling a scan while a tier is pinned', () => {
+    const h = pinnedHarness(true)
+    try {
+      const settled = document.createElement('div')
+      settled.className = 'router-fx'
+      settled.dataset.sessionKey = 's'
+      settled.dataset.turnIndex = '1'
+      settled.dataset.state = 'settled'
+      h.dock.appendChild(settled)
+
+      const foreign = document.createElement('div')
+      foreign.className = 'router-fx'
+      foreign.dataset.sessionKey = 'other-session'
+      foreign.dataset.turnIndex = '1'
+      foreign.dataset.state = 'settled'
+      h.dock.appendChild(foreign)
+
+      expect(h.renderer.scheduleBeginScan(h.anchor, 'seed')).toBe(false)
+      expect(settled.isConnected).toBe(false)
+      expect(foreign.isConnected).toBe(true)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('clears an existing settled strip for the current session when beginning a scan while a tier is pinned', () => {
+    const h = pinnedHarness(true)
+    try {
+      const settled = document.createElement('div')
+      settled.className = 'router-fx'
+      settled.dataset.sessionKey = 's'
+      settled.dataset.turnIndex = '1'
+      settled.dataset.state = 'settled'
+      h.dock.appendChild(settled)
+
+      const foreign = document.createElement('div')
+      foreign.className = 'router-fx'
+      foreign.dataset.sessionKey = 'other-session'
+      foreign.dataset.turnIndex = '1'
+      foreign.dataset.state = 'settled'
+      h.dock.appendChild(foreign)
+
+      expect(h.renderer.beginScan(h.anchor, 'seed')).toBe(false)
+      expect(settled.isConnected).toBe(false)
+      expect(foreign.isConnected).toBe(true)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('clears an existing settled strip when a hold-routed decision arrives', async () => {
+    const h = pinnedHarness(false)
+    try {
+      const settled = document.createElement('div')
+      settled.className = 'router-fx'
+      settled.dataset.sessionKey = 's'
+      settled.dataset.turnIndex = '1'
+      settled.dataset.state = 'settled'
+      h.dock.appendChild(settled)
+
+      const foreign = document.createElement('div')
+      foreign.className = 'router-fx'
+      foreign.dataset.sessionKey = 'other-session'
+      foreign.dataset.turnIndex = '1'
+      foreign.dataset.state = 'settled'
+      h.dock.appendChild(foreign)
+
+      await h.renderer.handleRouterDecision({
+        tier: 'c1',
+        model: 'z-ai/glm-5.2',
+        source: 'router_control_hold',
+      })
+      expect(settled.isConnected).toBe(false)
+      expect(foreign.isConnected).toBe(true)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('clears a live strip when a hold-routed decision arrives', async () => {
+    const h = pinnedHarness(false)
+    try {
+      const live = document.createElement('div')
+      live.className = 'router-fx'
+      live.dataset.sessionKey = 's'
+      live.dataset.live = 'true'
+      live.dataset.turnIndex = '1'
+      h.dock.appendChild(live)
+
+      await h.renderer.handleRouterDecision({
+        tier: 'c1',
+        model: 'z-ai/glm-5.2',
+        source: 'router_control_hold',
+      })
+      expect(live.isConnected).toBe(false)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('clearRouterFxVisuals removes every dock strip, including other sessions', () => {
+    const h = pinnedHarness(false)
+    try {
+      const settled = document.createElement('div')
+      settled.className = 'router-fx'
+      settled.dataset.sessionKey = 's'
+      settled.dataset.turnIndex = '1'
+      h.dock.appendChild(settled)
+
+      const foreign = document.createElement('div')
+      foreign.className = 'router-fx'
+      foreign.dataset.sessionKey = 'other-session'
+      foreign.dataset.turnIndex = '1'
+      h.dock.appendChild(foreign)
+
+      h.renderer.clearRouterFxVisuals('session_switch')
+      expect(settled.isConnected).toBe(false)
+      expect(foreign.isConnected).toBe(false)
+    } finally {
+      h.cleanup()
+    }
+  })
+
   it('still learns the pair on an ordinary unpinned turn', async () => {
     const h = pinnedHarness(false)
     try {
@@ -676,6 +800,46 @@ describe('createRouterFxRenderer history reconciliation', () => {
         ),
       ).not.toBeNull()
       harness.pref.enabled = false
+      harness.renderer.finishHistoryRouterFx()
+      expect(harness.dock.querySelector('.router-fx')).toBeNull()
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('prunes older settled strips during history finish if the latest turn was pinned', () => {
+    localStorage.clear()
+    const harness = makeHistoryRenderer()
+
+    try {
+      const user1 = document.createElement('div')
+      user1.className = 'msg user'
+      const user2 = document.createElement('div')
+      user2.className = 'msg user'
+      harness.thread.append(user1, user2)
+
+      const turn1Strip = harness.renderer.reconcileHistoryRouterFx(
+        {
+          routed_tier: 'c1',
+          routed_model: 'anthropic/claude-a',
+          routing_source: 'pilot_v1',
+          routing_applied: true,
+        },
+        { hintTimestamp: 1_700_000_000, requestKind: 'text', turnIndex: 1 },
+      )
+      expect(turn1Strip).not.toBeNull()
+      expect(harness.dock.contains(turn1Strip)).toBe(true)
+
+      const turn2Strip = harness.renderer.reconcileHistoryRouterFx(
+        {
+          routed_tier: 'c3',
+          routed_model: 'z-ai/glm-5.3',
+          routing_source: 'router_control_hold',
+        },
+        { hintTimestamp: 1_700_000_001, requestKind: 'text', turnIndex: 2 },
+      )
+      expect(turn2Strip).toBeNull()
+
       harness.renderer.finishHistoryRouterFx()
       expect(harness.dock.querySelector('.router-fx')).toBeNull()
     } finally {
