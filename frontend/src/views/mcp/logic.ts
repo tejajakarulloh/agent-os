@@ -161,6 +161,24 @@ export function validateServerDraft(
   return errors
 }
 
+function parseHeaders(raw: string): Record<string, string> {
+  try {
+    const parsed = JSON.parse(raw || '{}') as unknown
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const result: Record<string, string> = {}
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof v === 'string') {
+          result[k] = v
+        }
+      }
+      return result
+    }
+  } catch {
+    /* fallback to empty object */
+  }
+  return {}
+}
+
 export function serverFromDraft(draft: McpServerDraft): McpServerConfig {
   const stdio = draft.transport === 'stdio'
   return {
@@ -170,7 +188,7 @@ export function serverFromDraft(draft: McpServerDraft): McpServerConfig {
     args: stdio ? draft.args.trim().split(/\s+/).filter(Boolean) : [],
     url: stdio ? null : draft.url.trim(),
     env: draft.env,
-    headers: stdio ? {} : (JSON.parse(draft.headers || '{}') as Record<string, string>),
+    headers: stdio ? {} : parseHeaders(draft.headers),
     oauth: draft.transport === 'streamable_http' && draft.oauth,
     tool_timeout_seconds: Number(draft.timeout) || 30,
   }

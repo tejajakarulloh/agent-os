@@ -65,6 +65,24 @@ describe('MCP view logic', () => {
       headers: {},
       oauth: false,
     })
+
+    const httpDraft = createServerDraft({
+      name: 'remote',
+      transport: 'streamable_http',
+      url: 'https://example.com/mcp',
+    })
+    httpDraft.headers = '{"Authorization": "Bearer token", "X-Custom": "val"}'
+    expect(serverFromDraft(httpDraft).headers).toEqual({
+      Authorization: 'Bearer token',
+      'X-Custom': 'val',
+    })
+
+    // Safely handles malformed / non-object headers without throwing
+    httpDraft.headers = 'invalid-json{['
+    expect(serverFromDraft(httpDraft).headers).toEqual({})
+
+    httpDraft.headers = '["array"]'
+    expect(serverFromDraft(httpDraft).headers).toEqual({})
   })
 
   it('derives connection and Robinhood presentation from live status', () => {
