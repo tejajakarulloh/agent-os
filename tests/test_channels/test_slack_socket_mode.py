@@ -20,8 +20,9 @@ def _mk(**kwargs: Any) -> SlackChannel:
 
 
 class _FakeResp:
-    def __init__(self, payload: dict[str, Any]) -> None:
+    def __init__(self, payload: dict[str, Any], status_code: int = 200) -> None:
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
         return None

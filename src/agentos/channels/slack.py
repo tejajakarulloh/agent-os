@@ -22,7 +22,12 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from agentos.channels._reactions import NULL_STATUS_REACTOR, SlackStatusReactor
-from agentos.channels._util import ChannelAccessPolicy, EventDedupeCache, StreamThrottle
+from agentos.channels._util import (
+    ChannelAccessPolicy,
+    EventDedupeCache,
+    StreamThrottle,
+    retry_request,
+)
 from agentos.channels.contract import (
     ChannelCapabilities,
     ChannelCapabilityProfile,
@@ -389,7 +394,7 @@ class SlackChannel:
             payload[key] = value
 
         client = self._get_client()
-        resp = await client.post("/chat.postMessage", json=payload)
+        resp = await retry_request(client.post, "/chat.postMessage", json=payload)
         resp.raise_for_status()
         data = resp.json()
         if not data.get("ok"):
@@ -406,7 +411,8 @@ class SlackChannel:
         """Upload a local file to Slack using the external upload flow."""
         path = Path(file_path)
         client = self._get_client()
-        start_resp = await client.post(
+        start_resp = await retry_request(
+            client.post,
             "/files.getUploadURLExternal",
             json={"filename": path.name, "length": path.stat().st_size},
         )
@@ -419,8 +425,13 @@ class SlackChannel:
         if not upload_url or not file_id:
             raise RuntimeError("Slack file upload init response missing upload_url/file_id")
 
-        with path.open("rb") as f:
-            upload_resp = await client.post(upload_url, files={"file": (path.name, f)})
+        # Bytes, not an open handle: retry_request may POST again after a
+        # ReadTimeout, and a consumed file object would send an empty body.
+        upload_resp = await retry_request(
+            client.post,
+            upload_url,
+            files={"file": (path.name, path.read_bytes())},
+        )
         upload_resp.raise_for_status()
 
         complete_payload: dict[str, Any] = {
@@ -429,7 +440,8 @@ class SlackChannel:
         }
         if content:
             complete_payload["initial_comment"] = content
-        complete_resp = await client.post(
+        complete_resp = await retry_request(
+            client.post,
             "/files.completeUploadExternal",
             json=complete_payload,
         )
@@ -451,7 +463,7 @@ class SlackChannel:
             "text": content,
         }
         client = self._get_client()
-        resp = await client.post("/chat.update", json=payload)
+        resp = await retry_request(client.post, "/chat.update", json=payload)
         resp.raise_for_status()
         data = resp.json()
         if not data.get("ok"):
@@ -466,7 +478,7 @@ class SlackChannel:
             "ts": message_id,
         }
         client = self._get_client()
-        resp = await client.post("/chat.delete", json=payload)
+        resp = await retry_request(client.post, "/chat.delete", json=payload)
         resp.raise_for_status()
         data = resp.json()
         if not data.get("ok"):
@@ -513,7 +525,7 @@ class SlackChannel:
             }
             if thread_ts:
                 payload["thread_ts"] = thread_ts
-            resp = await client.post("/chat.postMessage", json=payload)
+            resp = await retry_request(client.post, "/chat.postMessage", json=payload)
             resp.raise_for_status()
             data = resp.json()
             if not data.get("ok"):
@@ -522,7 +534,8 @@ class SlackChannel:
             log.debug("slack.stream_start", ts=message_ts)
 
         async def _edit(text: str) -> None:
-            resp = await client.post(
+            resp = await retry_request(
+                client.post,
                 "/chat.update",
                 json={
                     "channel": target,

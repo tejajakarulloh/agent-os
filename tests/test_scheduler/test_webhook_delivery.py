@@ -97,7 +97,7 @@ async def test_ops_add_rejects_webhook_without_url(tmp_path: Path) -> None:
             await ops.add(
                 name="bad",
                 schedule_kind=ScheduleKind.CRON,
-            schedule_value="*/5 * * * *",
+                schedule_value="*/5 * * * *",
                 handler_key="agent_run",
                 payload=make_agent_turn_payload("x"),
                 session_target=SessionTarget.ISOLATED,
@@ -117,7 +117,7 @@ async def test_ops_add_rejects_webhook_with_bad_scheme(tmp_path: Path) -> None:
             await ops.add(
                 name="bad",
                 schedule_kind=ScheduleKind.CRON,
-            schedule_value="*/5 * * * *",
+                schedule_value="*/5 * * * *",
                 handler_key="agent_run",
                 payload=make_agent_turn_payload("x"),
                 session_target=SessionTarget.ISOLATED,
@@ -250,8 +250,21 @@ async def test_deliver_webhook_omits_authorization_when_no_token(monkeypatch) ->
 
 
 async def test_deliver_webhook_returns_failed_on_http_error(monkeypatch) -> None:
+    import asyncio
+
+    calls = 0
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr("agentos.channels._util.asyncio.sleep", fake_sleep)
+
     class _ErrorClient(_RecordingAsyncClient):
         async def post(self, url, json=None, headers=None):
+            nonlocal calls
+            calls += 1
+
             class _Resp:
                 status_code = 500
 
@@ -271,3 +284,81 @@ async def test_deliver_webhook_returns_failed_on_http_error(monkeypatch) -> None
         text="x",
     )
     assert status == "delivery_failed"
+    # 1 initial attempt + 3 retries
+    assert calls == 4
+
+
+async def test_deliver_webhook_retries_transient_error_and_recovers(monkeypatch) -> None:
+    calls = 0
+
+    async def fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("agentos.channels._util.asyncio.sleep", fake_sleep)
+
+    class _RecoveringClient(_RecordingAsyncClient):
+        async def post(self, url, json=None, headers=None):
+            nonlocal calls
+            calls += 1
+
+            class _Resp:
+                def __init__(self, status_code: int) -> None:
+                    self.status_code = status_code
+
+                def raise_for_status(self):
+                    if self.status_code >= 400:
+                        raise RuntimeError(f"HTTP {self.status_code}")
+
+            if calls < 3:
+                return _Resp(503)
+            return _Resp(200)
+
+    class _FakeHttpx:
+        AsyncClient = _RecoveringClient
+
+    monkeypatch.setitem(__import__("sys").modules, "httpx", _FakeHttpx)
+
+    chain = DeliveryChain()
+    status = await chain._deliver_webhook(
+        _webhook_job("https://hooks.example/cron"),
+        text="x",
+    )
+    assert status == "delivered"
+    assert calls == 3
+
+
+async def test_deliver_webhook_does_not_retry_fatal_401(monkeypatch) -> None:
+    calls = 0
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("agentos.channels._util.asyncio.sleep", fake_sleep)
+
+    class _FatalErrorClient(_RecordingAsyncClient):
+        async def post(self, url, json=None, headers=None):
+            nonlocal calls
+            calls += 1
+
+            class _Resp:
+                status_code = 401
+
+                def raise_for_status(self):
+                    raise RuntimeError("HTTP 401 Unauthorized")
+
+            return _Resp()
+
+    class _FakeHttpx:
+        AsyncClient = _FatalErrorClient
+
+    monkeypatch.setitem(__import__("sys").modules, "httpx", _FakeHttpx)
+
+    chain = DeliveryChain()
+    status = await chain._deliver_webhook(
+        _webhook_job("https://hooks.example/cron"),
+        text="x",
+    )
+    assert status == "delivery_failed"
+    assert calls == 1
+    assert sleeps == []
