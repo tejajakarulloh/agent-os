@@ -157,6 +157,23 @@ def _coerce_telegram_int(value: Any) -> int | str:
     return str(value)
 
 
+def _slice_utf16(text: str, offset: int, length: int) -> str:
+    """Slice ``text`` by a Telegram message-entity offset/length.
+
+    Telegram entity ``offset``/``length`` are counted in UTF-16 code units
+    (per the Bot API), while Python string indexing is by Unicode code point.
+    Any non-BMP character (emoji, some CJK-ext, math letters) earlier in the
+    message is one Python index but two UTF-16 units, so slicing the ``str``
+    directly drifts and misaligns the extracted mention/command. Encode to
+    UTF-16 and slice on the code-unit grid so the entity lines up exactly.
+    """
+    if offset < 0 or length < 0:
+        return ""
+    u16 = text.encode("utf-16-le")
+    return u16[offset * 2 : (offset + length) * 2].decode("utf-16-le", errors="replace")
+
+
+
 @dataclass
 class TelegramChannel:
     """Managed adapter for Telegram Bot API polling or webhooks."""
@@ -1084,7 +1101,7 @@ class TelegramChannel:
                 if entity_type == "mention":
                     offset = int(entity.get("offset", 0))
                     length = int(entity.get("length", 0))
-                    if text[offset : offset + length].lower() == mention:
+                    if _slice_utf16(text, offset, length).lower() == mention:
                         return True
                 if entity_type == "text_mention":
                     user = entity.get("user") or {}
@@ -1093,7 +1110,7 @@ class TelegramChannel:
                 if entity_type == "bot_command":
                     offset = int(entity.get("offset", 0))
                     length = int(entity.get("length", 0))
-                    command = text[offset : offset + length]
+                    command = _slice_utf16(text, offset, length)
                     _, separator, target = command.partition("@")
                     if not separator:
                         return True
