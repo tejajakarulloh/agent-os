@@ -88,7 +88,9 @@ class HybridRetriever:
         with self._lock:
             self._lexical_fp = None
             self._semantic_fp = None
-            self._lexical = None
+            if self._lexical is not None:
+                self._lexical.close()
+                self._lexical = None
             if self._semantic is not None:
                 self._semantic.invalidate()
 
@@ -107,6 +109,8 @@ class HybridRetriever:
             # population for ~44 skills is sub-millisecond, and even
             # strategy="semantic" needs it for fallback (spec §5.1).
             if self._lexical_fp != fp:
+                if self._lexical is not None:
+                    self._lexical.close()
                 self._lexical = LexicalIndex(skills)
                 self._lexical_fp = fp
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 
 import structlog
@@ -60,6 +61,9 @@ class LexicalIndex:
 
     def __init__(self, skills: list[SkillSpec]) -> None:
         self._skills = list(skills)
+        self._conn: sqlite3.Connection | None = None
+        self._built: bool = False
+        self._lock = threading.Lock()
 
     def rank(self, query: str, top_n: int = 20) -> list[Hit]:
         if not self._skills or not query or not query.strip():
@@ -75,34 +79,62 @@ class LexicalIndex:
             for i, (s, score) in enumerate(scored[:top_n])
         ]
 
-    def _fts_search(self, query: str) -> list[tuple[SkillSpec, float]]:
-        try:
-            conn = sqlite3.connect(":memory:")
-            conn.execute("CREATE VIRTUAL TABLE skills_fts USING fts5(name, description, triggers)")
-            for i, skill in enumerate(self._skills):
-                triggers_text = _stringify(skill.triggers)
+    def _ensure_built(self) -> sqlite3.Connection | None:
+        """Lazy thread-safe initialization of in-memory FTS5 table."""
+        if self._built:
+            return self._conn
+
+        with self._lock:
+            if self._built:
+                return self._conn
+            if not self._skills:
+                self._built = True
+                return None
+            try:
+                conn = sqlite3.connect(":memory:", check_same_thread=False)
                 conn.execute(
-                    "INSERT INTO skills_fts(rowid, name, description, triggers)"
-                    " VALUES (?, ?, ?, ?)",
+                    "CREATE VIRTUAL TABLE skills_fts USING fts5(name, description, triggers)"
+                )
+                rows = [
                     (
                         i,
                         _stringify(skill.name),
                         _stringify(skill.description),
-                        triggers_text,
-                    ),
-                )
+                        _stringify(skill.triggers),
+                    )
+                    for i, skill in enumerate(self._skills)
+                ]
+                with conn:
+                    conn.executemany(
+                        "INSERT INTO skills_fts(rowid, name, description, triggers)"
+                        " VALUES (?, ?, ?, ?)",
+                        rows,
+                    )
+                self._conn = conn
+            except Exception as exc:
+                log.debug("skills.retrieval.lexical_init_failed", error=str(exc))
+                self._conn = None
+            self._built = True
+            return self._conn
 
-            tokens = re.findall(r"\w+", query.lower())
-            if not tokens:
-                conn.close()
-                return []
-            fts_query = " OR ".join(tokens)
+    def _fts_search(self, query: str) -> list[tuple[SkillSpec, float]]:
+        conn = self._ensure_built()
+        if conn is None:
+            return []
 
-            rows = conn.execute(
-                "SELECT rowid, rank FROM skills_fts WHERE skills_fts MATCH ? ORDER BY rank",
-                (fts_query,),
-            ).fetchall()
-            conn.close()
+        tokens = re.findall(r"\w+", query.lower())
+        if not tokens:
+            return []
+        fts_query = " OR ".join(tokens)
+
+        try:
+            with self._lock:
+                if self._conn is None:
+                    return []
+                rows = self._conn.execute(
+                    "SELECT rowid, rank FROM skills_fts WHERE skills_fts MATCH ? ORDER BY rank",
+                    (fts_query,),
+                ).fetchall()
 
             # bm25 rank from FTS5 is a negative number (lower = better).
             # Negate and normalise to [0,1] across the result set for debug.
@@ -116,6 +148,17 @@ class LexicalIndex:
         except Exception as exc:
             log.debug("skills.retrieval.lexical_failed", error=str(exc))
             return []
+
+    def close(self) -> None:
+        """Idempotent teardown of the in-memory SQLite connection."""
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+            self._built = False
 
     def _substring_search(self, query: str) -> list[tuple[SkillSpec, float]]:
         tokens = list(set(query.lower().split()))
