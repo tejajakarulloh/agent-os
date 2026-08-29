@@ -59,13 +59,13 @@ describe('filterProjects', () => {
 
 describe('sessionsInProject / filterSessionsByProject', () => {
   const sessions = [
-    { key: 'k1', project_id: 'p1', updated_at: 100 },
-    { key: 'k2', project_id: 'p1', updated_at: 300 },
+    { key: 'k1', project_id: 'p1', updatedAt: 100 },
+    { key: 'k2', project_id: 'p1', updatedAt: 300 },
     { key: 'k3', projectId: 'p2', updated_at: 200 },
-    { key: 'k4', updated_at: 400 },
+    { key: 'k4', updatedAt: 400 },
   ]
 
-  it('lists a project sessions newest first', () => {
+  it('lists a project sessions newest first across both timestamp casings', () => {
     expect(sessionsInProject(sessions, 'p1').map((s) => s.key)).toEqual(['k2', 'k1'])
   })
 
@@ -77,11 +77,11 @@ describe('sessionsInProject / filterSessionsByProject', () => {
 })
 
 describe('groupProjectSessionsByAgent', () => {
-  it('buckets by agent alphabetically, each bucket newest first', () => {
+  it('buckets by agent alphabetically, each bucket newest first across both timestamp casings', () => {
     const sessions = [
-      { key: 'k1', agent_id: 'zeta', updated_at: 100 },
-      { key: 'k2', agentId: 'alpha', updated_at: 100 },
-      { key: 'k3', agent_id: 'alpha', updated_at: 300 },
+      { key: 'k1', agent_id: 'zeta', updatedAt: 100 },
+      { key: 'k2', agentId: 'alpha', updatedAt: 100 },
+      { key: 'k3', agent_id: 'alpha', updatedAt: 300 },
       { key: 'k4', updated_at: 50 },
     ]
     const groups = groupProjectSessionsByAgent(sessions)

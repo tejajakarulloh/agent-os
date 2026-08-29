@@ -76,7 +76,11 @@ export function filterProjects(projects: RawProject[], query: string): RawProjec
 export function sessionsInProject(sessions: RawSession[], id: string): RawSession[] {
   return sessions
     .filter((s) => sessionProjectId(s) === id)
-    .sort((a, b) => (Number(b.updated_at ?? 0) || 0) - (Number(a.updated_at ?? 0) || 0))
+    .sort(
+      (a, b) =>
+        (Number(b.updated_at ?? b.updatedAt ?? 0) || 0) -
+        (Number(a.updated_at ?? a.updatedAt ?? 0) || 0),
+    )
 }
 
 /** Group a project's sessions by their agent id (alphabetical), each bucket
@@ -96,7 +100,9 @@ export function groupProjectSessionsByAgent(
     .map(([agentId, items]) => ({
       agentId,
       items: [...items].sort(
-        (a, b) => (Number(b.updated_at ?? 0) || 0) - (Number(a.updated_at ?? 0) || 0),
+        (a, b) =>
+          (Number(b.updated_at ?? b.updatedAt ?? 0) || 0) -
+          (Number(a.updated_at ?? a.updatedAt ?? 0) || 0),
       ),
     }))
     .sort((a, b) => a.agentId.localeCompare(b.agentId))
