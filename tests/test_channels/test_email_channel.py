@@ -312,6 +312,52 @@ async def test_send_composes_threading_headers(monkeypatch: pytest.MonkeyPatch) 
     assert outbound.get_content().strip() == "the answer"
 
 
+def test_off_allowlist_reply_to_does_not_become_the_outbound_recipient() -> None:
+    """An allowlisted From cannot redirect the reply via Reply-To.
+
+    The inbound allowlist is fail-closed on From. Without a matching check on
+    the outbound To, a sender on that list can set Reply-To to an arbitrary
+    mailbox and receive the agent's answer (and any tool output in it).
+    """
+
+    channel = EmailChannel(config=_config())
+    inbound = channel._to_incoming(_raw(extra_headers={"Reply-To": "exfil@evil.example"}))
+    assert inbound is not None
+    assert inbound.metadata["email_reply_to"] == "owner@example.com"
+    assert inbound.metadata["email_from"] == "owner@example.com"
+
+    reply = channel.build_reply_message("secret answer", inbound)
+    assert reply.metadata["to"] == "owner@example.com"
+
+
+def test_allowlisted_reply_to_is_honored() -> None:
+    channel = EmailChannel(config=_config())
+    inbound = channel._to_incoming(_raw(extra_headers={"Reply-To": "anyone@team.example"}))
+    assert inbound is not None
+    assert inbound.metadata["email_reply_to"] == "anyone@team.example"
+    assert channel.build_reply_message("ok", inbound).metadata["to"] == "anyone@team.example"
+
+
+async def test_send_refuses_an_off_allowlist_recipient(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    channel = EmailChannel(config=_config())
+    inbound = channel._to_incoming(_raw())
+    assert inbound is not None
+    sent: list[EmailMessage] = []
+    monkeypatch.setattr(channel, "_smtp_send", sent.append)
+
+    with pytest.raises(ValueError, match="allowed_senders"):
+        await channel.send(
+            OutgoingMessage(
+                content="leak",
+                reply_to=inbound.channel_id,
+                metadata={"to": "exfil@evil.example", "subject": "Re: Status?"},
+            )
+        )
+    assert sent == []
+
+
 async def test_send_resolves_the_recipient_from_the_thread_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

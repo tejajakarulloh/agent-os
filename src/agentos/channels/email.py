@@ -17,9 +17,10 @@ Access control
 --------------
 ``allowed_senders`` is a fail-closed From-address allowlist. Entries are
 exact addresses (``me@example.com``) or domain patterns (``*@example.com``
-/ ``@example.com``). It is enforced twice: at poll time, so a stranger's
-mail is never queued, and again through ``evaluate_access`` so gateway
-dispatch reaches the same verdict.
+/ ``@example.com``). It is enforced three times: at poll time, so a
+stranger's mail is never queued; through ``evaluate_access`` so gateway
+dispatch reaches the same verdict; and on outbound ``To``, so an
+allowlisted sender cannot redirect the reply via ``Reply-To``.
 
 Loop safety
 -----------
@@ -539,6 +540,18 @@ class EmailChannel:
         subject = decode_header_value(parsed.get("Subject"))
         body = strip_quoted_reply(_body_text(parsed))
         reply_to = normalize_address(parsed.get("Reply-To", "")) or sender
+        # Outbound To is the blast radius of a reply. Honor Reply-To only when
+        # the address is on the same fail-closed allowlist that admitted the
+        # sender; otherwise an allowlisted From can exfiltrate the agent's
+        # answer (and any tool output in it) to an arbitrary mailbox.
+        if not sender_allowed(reply_to, self.config.allowed_senders):
+            log.warning(
+                "email.reply_to_not_allowed",
+                name=self.config.name,
+                sender=sender,
+                reply_to=reply_to,
+            )
+            reply_to = sender
 
         self._remember_thread(
             thread_id,
@@ -639,6 +652,8 @@ class EmailChannel:
         to_address = str(metadata.get("to") or (thread.to_address if thread else ""))
         if not to_address:
             raise ValueError("email.send has no recipient for reply_to")
+        if not sender_allowed(to_address, self.config.allowed_senders):
+            raise ValueError("email.send recipient is not on the allowed_senders allowlist")
         subject = str(metadata.get("subject") or "").strip()
         if not subject:
             subject = reply_subject(thread.subject if thread else "")
