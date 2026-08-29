@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from agentos.safety.injection_guard import xml_escape
 from agentos.skills.types import SkillLayer, SkillSpec
 
 #: Character budget for the injected skills block when nothing configures one.
@@ -39,9 +40,7 @@ _LAYER_PRECEDENCE: dict[SkillLayer, int] = {
 }
 _UNKNOWN_LAYER_RANK = len(_LAYER_PRECEDENCE)
 
-
-def _escape_xml(s: str) -> str:
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+_escape_xml = xml_escape
 
 
 def _layer_rank(skill: SkillSpec) -> int:

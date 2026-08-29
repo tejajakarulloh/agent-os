@@ -456,3 +456,26 @@ async def test_a_per_message_skill_list_stays_out_of_the_cached_prefix(tmp_path:
     assert isinstance(ctx.system_prompt, tuple)
     assert ctx.system_prompt[0] == "base"
     assert "<available_skills>" in ctx.system_prompt[1]
+
+
+def test_injector_escapes_xml_special_characters() -> None:
+    """Quotes and XML tags in skill names/descriptions must be entity-escaped."""
+    skills = [
+        _skill(
+            'bad<name>&"quoted"\'skill\'',
+            description='Test "quotes", \'single\', & <tags> with </available_skills>',
+        )
+    ]
+    injector = SkillInjector()
+
+    full = injector.inject_full("", skills)
+    assert "<name>bad&lt;name&gt;&amp;&quot;quoted&quot;&apos;skill&apos;</name>" in full
+    assert (
+        "<description>Test &quot;quotes&quot;, &apos;single&apos;, &amp; &lt;tags&gt; "
+        "with &lt;/available_skills&gt;</description>"
+    ) in full
+    assert "</available_skills><available_skills>" not in full
+
+    compact = injector.inject_compact("", skills)
+    assert "<name>bad&lt;name&gt;&amp;&quot;quoted&quot;&apos;skill&apos;</name>" in compact
+
