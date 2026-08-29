@@ -184,10 +184,13 @@ describe('splitGroupRows', () => {
 describe('shortPath', () => {
   it('keeps the identifying tail and marks the elision', () => {
     expect(shortPath('/very/long/path/to/state/.env')).toBe('…/state/.env')
+    expect(shortPath('C:\\Users\\alice\\AppData\\Roaming\\.agentos\\.env')).toBe('…/.agentos/.env')
   })
 
   it('leaves an already-short path alone', () => {
     expect(shortPath('/tmp/.env')).toBe('/tmp/.env')
+    expect(shortPath('.env')).toBe('.env')
+    expect(shortPath('C:\\.env')).toBe('C:\\.env')
   })
 
   it('handles an absent path', () => {

@@ -203,7 +203,8 @@ export function validateNewName(name: string, known: EnvVarRow[]): string | null
  */
 export function shortPath(path: string | undefined): string {
   if (!path) return ''
-  const segments = path.split('/').filter(Boolean)
+  const normalized = path.replace(/\\/g, '/')
+  const segments = normalized.split('/').filter(Boolean)
   if (segments.length <= 2) return path
   return t('env.shortPath', { tail: segments.slice(-2).join('/') })
 }
