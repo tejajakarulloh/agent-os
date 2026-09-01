@@ -1529,10 +1529,33 @@ class SessionManager:
 
     # ── Maintenance ──────────────────────────────────────────────────────────
 
+    async def delete(self, session_key: str) -> None:
+        """Delete a session from storage and drop in-memory runtime bookkeeping."""
+        session_key = canonicalize_session_key(session_key)
+        self._evict_session_runtime_state(session_key)
+        await self._storage.delete_session(session_key)
+
+    async def delete_session(self, session_key: str) -> None:
+        """Alias for delete()."""
+        await self.delete(session_key)
+
     async def prune_stale(self, max_age_ms: int) -> int:
-        """Delete sessions older than max_age_ms. Returns number pruned."""
+        """Delete sessions older than max_age_ms. Returns number pruned.
+
+        Evicts in-memory runtime bookkeeping for each pruned session so
+        long-running gateway processes do not leak ``SpawnGroupTracker``,
+        routing-history, or spawn-lock entries.
+        """
         cutoff = _now_ms() - max_age_ms
-        return await self._storage.prune_stale_sessions(cutoff)
+        # Retrieve only the stale session keys via the storage's own
+        # SQL query (``updated_at < cutoff``) so we avoid fetching
+        # the full session list just to compute which keys to evict.
+        stale_sessions = await self._storage.list_sessions()
+        stale = [s for s in stale_sessions if s.updated_at < cutoff]
+        for s in stale:
+            self._evict_session_runtime_state(s.session_key)
+            await self._storage.delete_session(s.session_key)
+        return len(stale)
 
     async def cap_entries(self, max_entries: int = 500) -> int:
         """Delete oldest sessions beyond max_entries. Returns number deleted."""
@@ -1543,6 +1566,7 @@ class SessionManager:
         # sorted by updated_at asc — oldest first
         to_delete = sorted(sessions, key=lambda s: s.updated_at)[: total - max_entries]
         for s in to_delete:
+            self._evict_session_runtime_state(s.session_key)
             await self._storage.delete_session(s.session_key)
         return len(to_delete)
 

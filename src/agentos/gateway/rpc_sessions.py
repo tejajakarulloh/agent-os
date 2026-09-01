@@ -1950,7 +1950,17 @@ async def _handle_sessions_delete(params: dict | None, ctx: RpcContext) -> dict:
     errors: list[str] = []
     for k in keys:
         try:
-            await storage.delete_session(k)
+            if ctx.task_runtime is not None:
+                await _cancel_task_runtime(
+                    ctx.task_runtime,
+                    session_key=k,
+                    source="sessions_delete",
+                    reason="session_deleted",
+                )
+            if hasattr(ctx.session_manager, "delete"):
+                await ctx.session_manager.delete(k)
+            else:
+                await storage.delete_session(k)
             deleted.append(k)
         except Exception as exc:
             errors.append(f"{k}: {exc}")
