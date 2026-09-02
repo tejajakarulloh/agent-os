@@ -10,6 +10,32 @@ from typing import Any, Protocol
 
 from agentos.gateway_client import normalize_gateway_url
 
+# Resource-exhaustion caps for the MCP bridge. The bridge sits between an
+# untrusted client (the operator's own MCP host, but every parameter on the
+# four call paths below is chosen by the model on every call) and a single
+# gateway that must stay responsive for every other channel — so a runaway
+# `max_events=10**9` or `timeout_ms=3_600_000` is a self-inflicted availability
+# problem, not a hypothetical external DoS.
+#
+# Each cap is the smallest value that still lets a reasonable model-driven
+# call succeed; we clamp silently (no error) so a badly-chosen argument
+# degrades gracefully instead of surfacing a tool error to the user.
+#
+#   _MAX_TIMEOUT_MS_UPPER:   5 minutes. Long enough for a long reasoning
+#                            turn to settle; a 30-minute wait is indistinguishable
+#                            from a stuck gateway in the UI.
+#   _MAX_EVENTS_UPPER:       10k events. At ~1KB/event that's a ~10MB response —
+#                            well past what a single model turn needs to consume.
+#   _MAX_HISTORY_LIMIT_UPPER: 5k messages. Transcript lookback for a rehydrating
+#                            turn rarely exceeds a few thousand.
+#   _MAX_SESSIONS_LIMIT_UPPER: 5k sessions. Even a busy install has well under
+#                            1000 active sessions; anything more is an enumeration
+#                            request that should paginate, not a single bulk read.
+_MAX_TIMEOUT_MS_UPPER = 300_000
+_MAX_EVENTS_UPPER = 10_000
+_MAX_HISTORY_LIMIT_UPPER = 5_000
+_MAX_SESSIONS_LIMIT_UPPER = 5_000
+
 
 class GatewayClientLike(Protocol):
     async def connect(self, url: str) -> None: ...
@@ -42,11 +68,7 @@ class AgentOSMCPBridge:
         gateway_url: str | None = None,
         gateway_client_factory: Callable[[], GatewayClientLike] = _default_gateway_client,
     ) -> None:
-        raw_url = (
-            gateway_url
-            or os.environ.get("AGENTOS_GATEWAY_URL")
-            or "ws://localhost:18791/ws"
-        )
+        raw_url = gateway_url or os.environ.get("AGENTOS_GATEWAY_URL") or "ws://localhost:18791/ws"
         self.gateway_url = normalize_gateway_url(raw_url)
         self._gateway_client_factory = gateway_client_factory
         self._client: GatewayClientLike | None = None
@@ -65,7 +87,7 @@ class AgentOSMCPBridge:
 
     async def conversations_list(self, limit: int = 50) -> dict[str, Any]:
         client = await self._ensure_client()
-        return await client.list_sessions(limit=limit)
+        return await client.list_sessions(limit=min(limit, _MAX_SESSIONS_LIMIT_UPPER))
 
     async def session_resolve(self, key: str) -> dict[str, Any]:
         client = await self._ensure_client()
@@ -73,7 +95,7 @@ class AgentOSMCPBridge:
 
     async def messages_read(self, key: str, limit: int = 1000) -> dict[str, Any]:
         client = await self._ensure_client()
-        return await client.session_history(key, limit=limit)
+        return await client.session_history(key, limit=min(limit, _MAX_HISTORY_LIMIT_UPPER))
 
     async def messages_send(
         self,
@@ -131,8 +153,12 @@ class AgentOSMCPBridge:
             current_stream_seq = int(
                 subscription.get("current_stream_seq") or since_stream_seq or 0
             )
-            deadline = time.monotonic() + max(0, timeout_ms) / 1000
-            max_events = max(1, max_events)
+            # Clamp both bounds: an absurd timeout turns the call into a stuck
+            # gateway, and a non-positive max_events would loop indefinitely
+            # (the `while len(events) < max_events` predicate never advances).
+            max_events = min(max(1, max_events), _MAX_EVENTS_UPPER)
+            timeout_ms = min(max(0, timeout_ms), _MAX_TIMEOUT_MS_UPPER)
+            deadline = time.monotonic() + timeout_ms / 1000
 
             while len(events) < max_events:
                 remaining = deadline - time.monotonic()
@@ -168,7 +194,7 @@ class AgentOSMCPBridge:
             await client.close()
 
     async def transcript_jsonl(self, key: str, limit: int = 1000) -> str:
-        history = await self.messages_read(key, limit=limit)
+        history = await self.messages_read(key, limit=min(limit, _MAX_HISTORY_LIMIT_UPPER))
         messages = history.get("messages", []) if isinstance(history, dict) else []
         rows = [_message_to_event(row) for row in messages if isinstance(row, dict)]
         flattened: list[dict[str, Any]] = []

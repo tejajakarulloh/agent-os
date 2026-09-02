@@ -33,6 +33,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **MCP bridge resource-exhaustion clamps** — `events_wait`, `conversations_list`,
+  `messages_read`, and `transcript_jsonl` now silently upper-clamp their
+  `max_events`, `timeout_ms`, session-list, and history-limit arguments to
+  module-level caps. The four call paths were previously only lower-clamped
+  (`max(1, max_events)`, `max(0, timeout_ms)`), so a model that asked for
+  `max_events=10**9` would loop forever waiting for ten billion events, and a
+  `timeout_ms=3_600_000` would hand a 1-hour deadline to the underlying
+  `recv_event` and make the call indistinguishable from a stuck gateway. The
+  new caps are 5 minutes / 10k events / 5k messages / 5k sessions — large
+  enough that no reasonable model-driven call will ever hit them, small
+  enough that a single runaway argument cannot wedge the gateway.
+  ([#685](https://github.com/use-agent-os/agent-os/issues/685))
+
 - Telegram Bot API calls now retry `ConnectTimeout` and `PoolTimeout` alongside
   `ConnectError`. All three happen before any request bytes reach Telegram — a
   DNS/TLS handshake that never completed, or a wait for a pooled connection —

@@ -8,7 +8,13 @@ from typing import Any
 
 import pytest
 
-from agentos.mcp_server.bridge import AgentOSMCPBridge
+from agentos.mcp_server.bridge import (
+    _MAX_EVENTS_UPPER,
+    _MAX_HISTORY_LIMIT_UPPER,
+    _MAX_SESSIONS_LIMIT_UPPER,
+    _MAX_TIMEOUT_MS_UPPER,
+    AgentOSMCPBridge,
+)
 
 
 class FakeGatewayClient:
@@ -17,6 +23,7 @@ class FakeGatewayClient:
         self.closed = False
         self.calls: list[tuple[str, dict[str, Any] | None]] = []
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.last_recv_timeout: float | None = None
 
     async def connect(self, url: str) -> None:
         self.connected_url = url
@@ -90,6 +97,9 @@ class FakeGatewayClient:
         raise AssertionError(f"unexpected method: {method}")
 
     async def recv_event(self, timeout: float | None = None) -> dict[str, Any]:
+        # Recorded for events_wait()'s deadline-clamp assertion — see
+        # test_events_wait_clamps_effective_recv_deadline below.
+        self.last_recv_timeout = timeout
         if timeout is None:
             return await self.events.get()
         return await asyncio.wait_for(self.events.get(), timeout=timeout)
@@ -261,3 +271,227 @@ async def test_events_wait_uses_dedicated_connection_and_closes_it() -> None:
     assert result["current_stream_seq"] == 8
     assert clients[0].closed is False
     assert event_client.closed is True
+
+
+# --- Resource-exhaustion clamps (issue #685) --------------------------------
+#
+# Every parameter on these four call paths is chosen by the model on every
+# call, so a runaway value is a self-inflicted availability problem rather than
+# a remote DoS. The bridge silently clamps to module-level caps defined in
+# `agentos.mcp_server.bridge`. These tests assert the clamp on both bounds for
+# every vector.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        # Below the cap: pass through untouched.
+        (50, 50),
+        (1, 1),
+        # At the cap: pass through.
+        (_MAX_SESSIONS_LIMIT_UPPER, _MAX_SESSIONS_LIMIT_UPPER),
+        # Above the cap: silently clamp to the cap.
+        (_MAX_SESSIONS_LIMIT_UPPER + 1, _MAX_SESSIONS_LIMIT_UPPER),
+        (10**9, _MAX_SESSIONS_LIMIT_UPPER),
+    ],
+)
+async def test_conversations_list_clamps_limit(requested: int, expected: int) -> None:
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.conversations_list(limit=requested)
+
+    method, params = client.calls[0]
+    assert method == "sessions.list"
+    assert params == {"limit": expected}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (1000, 1000),
+        (_MAX_HISTORY_LIMIT_UPPER, _MAX_HISTORY_LIMIT_UPPER),
+        (_MAX_HISTORY_LIMIT_UPPER * 10, _MAX_HISTORY_LIMIT_UPPER),
+        (10**9, _MAX_HISTORY_LIMIT_UPPER),
+    ],
+)
+async def test_messages_read_clamps_limit(requested: int, expected: int) -> None:
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.messages_read("agent:main:main", limit=requested)
+
+    method, params = client.calls[0]
+    assert method == "chat.history"
+    assert params == {"sessionKey": "agent:main:main", "limit": expected}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (1000, 1000),
+        (_MAX_HISTORY_LIMIT_UPPER, _MAX_HISTORY_LIMIT_UPPER),
+        (_MAX_HISTORY_LIMIT_UPPER * 10, _MAX_HISTORY_LIMIT_UPPER),
+        (10**9, _MAX_HISTORY_LIMIT_UPPER),
+    ],
+)
+async def test_transcript_jsonl_clamps_limit(requested: int, expected: int) -> None:
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.transcript_jsonl("agent:main:main", limit=requested)
+
+    method, params = client.calls[0]
+    assert method == "chat.history"
+    assert params == {"sessionKey": "agent:main:main", "limit": expected}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_timeout", "requested_events"),
+    [
+        # Below the cap: pass through.
+        (1000, 1),
+        # At the cap: pass through.
+        (_MAX_TIMEOUT_MS_UPPER, _MAX_EVENTS_UPPER),
+        # Above the cap: clamp.
+        (_MAX_TIMEOUT_MS_UPPER * 10, _MAX_EVENTS_UPPER * 10),
+        (10**9, 10**9),
+    ],
+)
+async def test_events_wait_returns_for_huge_clamped_arguments(
+    requested_timeout: int, requested_events: int
+) -> None:
+    """A pre-loaded terminal event lets the call return immediately, so a
+    several-hour timeout that gets clamped to 5 minutes still resolves on the
+    first recv_event tick — the test cares that the loop terminates, not how
+    long it would have waited without the clamp."""
+    client = FakeGatewayClient()
+    await client.events.put(
+        {
+            "event": "session.event.done",
+            "payload": {"session_key": "agent:main:main", "stream_seq": 8},
+        }
+    )
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    result = await bridge.events_wait(
+        "agent:main:main",
+        since_stream_seq=7,
+        timeout_ms=requested_timeout,
+        max_events=requested_events,
+    )
+
+    assert result["current_stream_seq"] == 8
+    assert result["timed_out"] is False
+
+
+@pytest.mark.asyncio
+async def test_events_wait_clamps_max_events_to_upper() -> None:
+    """A max_events=10**9 would loop indefinitely waiting for ten billion
+    events. After clamping, the bridge returns as soon as a terminal event
+    arrives, even though the caller asked for the full ten billion."""
+    client = FakeGatewayClient()
+    await client.events.put(
+        {
+            "event": "session.event.done",
+            "payload": {"session_key": "agent:main:main", "stream_seq": 1},
+        }
+    )
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    result = await bridge.events_wait(
+        "agent:main:main",
+        timeout_ms=5000,
+        max_events=10**9,
+    )
+
+    assert len(result["events"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_events_wait_floors_non_positive_max_events_to_one() -> None:
+    """The lower clamp `max(1, max_events)` is what kept the original code
+    from looping forever on `max_events=0` or negative values. Pin it so a
+    refactor that drops the clamp is caught immediately."""
+    client = FakeGatewayClient()
+    await client.events.put(
+        {
+            "event": "session.event.done",
+            "payload": {"session_key": "agent:main:main", "stream_seq": 1},
+        }
+    )
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    for bogus in (0, -1, -100):
+        if bogus != 0:
+            await client.events.put(
+                {
+                    "event": "session.event.done",
+                    "payload": {
+                        "session_key": "agent:main:main",
+                        "stream_seq": bogus + 2,
+                    },
+                }
+            )
+        result = await bridge.events_wait(
+            "agent:main:main",
+            timeout_ms=1000,
+            max_events=bogus,
+        )
+        assert len(result["events"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_events_wait_clamps_effective_recv_deadline() -> None:
+    """A 1-hour timeout_ms must not propagate a 3600-second `timeout` to
+    recv_event — the clamp on `timeout_ms` is what keeps the loop from
+    blocking on a single recv_event call for an hour.
+
+    The fake is pre-loaded with a terminal event so the call returns
+    immediately; we then assert the value the bridge forwarded to the
+    underlying recv_event is no larger than the upper clamp."""
+    client = FakeGatewayClient()
+    await client.events.put(
+        {
+            "event": "session.event.done",
+            "payload": {"session_key": "agent:main:main", "stream_seq": 1},
+        }
+    )
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.events_wait(
+        "agent:main:main",
+        timeout_ms=3_600_000,
+        max_events=1,
+    )
+
+    assert client.last_recv_timeout is not None
+    assert client.last_recv_timeout <= _MAX_TIMEOUT_MS_UPPER / 1000 + 0.1
+
+
+@pytest.mark.asyncio
+async def test_events_wait_floors_non_positive_timeout_to_zero() -> None:
+    """`timeout_ms=0` and negative values must produce a deadline at or before
+    `now`, so the loop exits before even calling recv_event — the worst case
+    is `recv_event` being asked to wait forever, which is what the original
+    `max(0, timeout_ms) / 1000` accidentally avoided (it would have produced
+    `now + 0`, i.e. an immediate deadline, but only because the sign was
+    swallowed)."""
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    for bogus in (0, -1, -1000):
+        result = await bridge.events_wait(
+            "agent:main:main",
+            timeout_ms=bogus,
+            max_events=1,
+        )
+        # No events were pre-loaded, and the loop exited on the first
+        # `remaining <= 0` check, so recv_event was never called.
+        assert result["events"] == []
+        assert result["timed_out"] is True
+        assert client.last_recv_timeout is None
