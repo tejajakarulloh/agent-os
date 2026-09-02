@@ -33,6 +33,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **FTS5 query sanitizer now preserves Unicode letters and digits** —
+  `SessionStorage.sanitize_fts_query` was an ASCII-only whitelist that
+  turned every non-ASCII letter into a space, silently emptying queries
+  in every non-English locale (CJK, Cyrillic, Vietnamese, accented
+  Latin, Arabic, …) and additionally producing **wrong** matches by
+  truncating accented tokens to their ASCII prefix (`café` → `"caf"`
+  then matched unrelated content). The sanitizer now uses a blocklist
+  that strips FTS5 syntax characters (`"`, `(`, `)`, `*`, `^`, `:`) and
+  control / format / private-use codepoints, while letting every letter
+  or digit of any script through untouched. The two existing safety
+  properties — per-token double-quoting and the 20-token cap — are
+  preserved and asserted in the regression tests.
+  ([#903](https://github.com/use-agent-os/agent-os/issues/903))
+
 - Telegram Bot API calls now retry `ConnectTimeout` and `PoolTimeout` alongside
   `ConnectError`. All three happen before any request bytes reach Telegram — a
   DNS/TLS handshake that never completed, or a wait for a pooled connection —

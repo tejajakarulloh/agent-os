@@ -109,15 +109,12 @@ CREATE TABLE IF NOT EXISTS projects (
 )
 """
 
-_CREATE_IDX_PROJECTS_AGENT = (
-    "CREATE INDEX IF NOT EXISTS idx_projects_agent ON projects(agent_id)"
-)
+_CREATE_IDX_PROJECTS_AGENT = "CREATE INDEX IF NOT EXISTS idx_projects_agent ON projects(agent_id)"
 
 # Backstop for the advisory Python-side name check (closes the concurrent
 # create race). NOCASE folds ASCII only; the casefold check stays primary.
 _CREATE_UNIQUE_IDX_PROJECTS_NAME = (
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name_nocase "
-    "ON projects(name COLLATE NOCASE)"
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name_nocase ON projects(name COLLATE NOCASE)"
 )
 
 _CREATE_IDX_SESSIONS_PROJECT = (
@@ -493,15 +490,11 @@ class SessionStorage:
             )
             await self._conn.commit()
         # Defensive: zero-out any NULL epoch rows left by a partial migration.
-        async with self._conn.execute(
-            "SELECT COUNT(*) FROM sessions WHERE epoch IS NULL"
-        ) as cur:
+        async with self._conn.execute("SELECT COUNT(*) FROM sessions WHERE epoch IS NULL") as cur:
             row = await cur.fetchone()
         null_count = row[0] if row else 0
         if null_count > 0:
-            await self._conn.execute(
-                "UPDATE sessions SET epoch = 0 WHERE epoch IS NULL"
-            )
+            await self._conn.execute("UPDATE sessions SET epoch = 0 WHERE epoch IS NULL")
             await self._conn.commit()
 
     async def _migrate_transcript_reasoning_content_column(self) -> None:
@@ -521,9 +514,7 @@ class SessionStorage:
         async with self._conn.execute("PRAGMA table_info(transcript_entries)") as cur:
             columns = [row[1] for row in await cur.fetchall()]
         if "turn_usage" not in columns:
-            await self._conn.execute(
-                "ALTER TABLE transcript_entries ADD COLUMN turn_usage TEXT"
-            )
+            await self._conn.execute("ALTER TABLE transcript_entries ADD COLUMN turn_usage TEXT")
             await self._conn.commit()
 
     async def _migrate_summary_metadata_columns(self) -> None:
@@ -556,8 +547,7 @@ class SessionStorage:
             "tokens_before": "ALTER TABLE session_summaries ADD COLUMN tokens_before INTEGER",
             "tokens_after": "ALTER TABLE session_summaries ADD COLUMN tokens_after INTEGER",
             "removed_count": (
-                "ALTER TABLE session_summaries ADD COLUMN "
-                "removed_count INTEGER NOT NULL DEFAULT 0"
+                "ALTER TABLE session_summaries ADD COLUMN removed_count INTEGER NOT NULL DEFAULT 0"
             ),
             "kept_count": (
                 "ALTER TABLE session_summaries ADD COLUMN kept_count INTEGER NOT NULL DEFAULT 0"
@@ -587,9 +577,7 @@ class SessionStorage:
             "coverage_turn_id": (
                 "ALTER TABLE memory_durable_receipts ADD COLUMN coverage_turn_id TEXT"
             ),
-            "coverage_hash": (
-                "ALTER TABLE memory_durable_receipts ADD COLUMN coverage_hash TEXT"
-            ),
+            "coverage_hash": ("ALTER TABLE memory_durable_receipts ADD COLUMN coverage_hash TEXT"),
             "coverage_entry_count": (
                 "ALTER TABLE memory_durable_receipts ADD COLUMN coverage_entry_count INTEGER"
             ),
@@ -875,9 +863,7 @@ class SessionStorage:
                 "UPDATE sessions SET project_id = NULL WHERE project_id = ?",
                 (project_id,),
             )
-            await self.conn.execute(
-                "DELETE FROM projects WHERE project_id = ?", (project_id,)
-            )
+            await self.conn.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
             await self.conn.commit()
         except Exception:
             await self.conn.rollback()
@@ -967,8 +953,7 @@ class SessionStorage:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params += [limit, offset]
         sql = (
-            f"SELECT * FROM agent_tasks {where} "
-            "ORDER BY created_at ASC, rowid ASC LIMIT ? OFFSET ?"
+            f"SELECT * FROM agent_tasks {where} ORDER BY created_at ASC, rowid ASC LIMIT ? OFFSET ?"
         )
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
@@ -1065,9 +1050,7 @@ class SessionStorage:
         allowed = set(MemoryDurableReceipt.model_fields) - {"receipt_id", "created_at"}
         unknown = sorted(set(fields) - allowed)
         if unknown:
-            raise ValueError(
-                f"Unknown memory durable receipt fields: {', '.join(unknown)}"
-            )
+            raise ValueError(f"Unknown memory durable receipt fields: {', '.join(unknown)}")
         if "session_key" in fields:
             fields["session_key"] = canonicalize_session_key(fields["session_key"])
         fields.setdefault("updated_at", _now_ms())
@@ -1180,7 +1163,7 @@ class SessionStorage:
                 raise StaleEpochError(
                     f"Epoch mismatch for {entry.session_key}: "
                     f"expected {expected_epoch}, got {actual}"
-            )
+                )
             await self.conn.commit()
         else:
             sql = f"INSERT INTO transcript_entries ({', '.join(cols)}) VALUES ({placeholders})"
@@ -1257,9 +1240,7 @@ class SessionStorage:
             ORDER BY created_at ASC, id ASC
             LIMIT ? OFFSET ?
         """
-        async with self.conn.execute(
-            sql, (session_id, session_id, limit_val, offset)
-        ) as cur:
+        async with self.conn.execute(sql, (session_id, session_id, limit_val, offset)) as cur:
             rows = await cur.fetchall()
         return [TranscriptEntry(**_deserialize_row(dict(r))) for r in rows]
 
@@ -1333,9 +1314,7 @@ class SessionStorage:
             row = await cur.fetchone()
         return row[0] if row else 0
 
-    async def count_transcript_entries_batch(
-        self, session_ids: list[str]
-    ) -> dict[str, int]:
+    async def count_transcript_entries_batch(self, session_ids: list[str]) -> dict[str, int]:
         """Count transcript entries for many sessions in one round trip.
 
         Used by ``sessions.list`` (rpc_sessions.py) to avoid the N+1 pattern
@@ -1493,9 +1472,7 @@ class SessionStorage:
                 node=node,
                 entries=archived_entries or [],
                 compaction_id=summary.compaction_id if summary is not None else None,
-                compaction_index=summary.compaction_index
-                if summary is not None
-                else None,
+                compaction_index=summary.compaction_index if summary is not None else None,
             )
 
             await self.conn.execute(
@@ -1669,9 +1646,7 @@ class SessionStorage:
 
     # ── SessionContextState CRUD ─────────────────────────────────────────────
 
-    async def save_context_state(
-        self, state: SessionContextState
-    ) -> SessionContextState:
+    async def save_context_state(self, state: SessionContextState) -> SessionContextState:
         """Persist portable or provider-native context state for later replay."""
         state.session_key = canonicalize_session_key(state.session_key)
         data = state.model_dump(exclude={"id"})
@@ -1679,8 +1654,7 @@ class SessionStorage:
         placeholders = ", ".join("?" for _ in cols)
         values = [_serialize(data[c]) for c in cols]
         async with self.conn.execute(
-            "INSERT INTO session_context_states "
-            f"({', '.join(cols)}) VALUES ({placeholders})",
+            f"INSERT INTO session_context_states ({', '.join(cols)}) VALUES ({placeholders})",
             values,
         ) as cur:
             state.id = cur.lastrowid
@@ -1708,8 +1682,7 @@ class SessionStorage:
             clauses.append("valid = 1")
         where = " AND ".join(clauses)
         async with self.conn.execute(
-            "SELECT * FROM session_context_states "
-            f"WHERE {where} ORDER BY created_at ASC, id ASC",
+            f"SELECT * FROM session_context_states WHERE {where} ORDER BY created_at ASC, id ASC",
             params,
         ) as cur:
             rows = await cur.fetchall()
@@ -1748,17 +1721,59 @@ class SessionStorage:
     def sanitize_fts_query(raw: str) -> str:
         """Sanitize a user query for safe FTS5 MATCH.
 
-        Strips FTS5 operators and special chars, wraps each token in quotes.
+        The FTS5 ``unicode61`` tokenizer (used by default on the
+        ``transcript_fts`` virtual table) indexes and matches any Unicode
+        letter or digit, so the sanitizer is the *only* layer that decides
+        which characters survive into the MATCH expression. The previous
+        ASCII whitelist turned every non-ASCII letter into a space, which
+        silently emptied queries in every non-English locale (CJK, Cyrillic,
+        Vietnamese, accented Latin, Arabic, …) and additionally produced
+        **wrong** matches by truncating accented tokens to their ASCII
+        prefix (``café`` → ``"caf"`` then matched unrelated content).
+
+        Approach:
+          * Block FTS5 syntax characters that change MATCH semantics
+            (``"`` ``(`` ``)`` ``*`` ``^`` ``:``) and ASCII control/format
+            characters. Replace each with a single space so the surrounding
+            words do not fuse.
+          * Let every letter or digit of any script through untouched.
+          * Preserve the two existing safety properties: per-token
+            double-quoting (so FTS5 treats the token as a literal, not as
+            syntax) and the 20-token cap.
+
+        The empty-guard at the bottom still fires for queries that are pure
+        syntax / control characters, returning ``""`` so ``search_transcript``
+        short-circuits to ``[]`` rather than issuing a MATCH for nothing.
         """
         import re as _re
 
-        # Whitelist: only allow alphanumeric and whitespace through
-        cleaned = _re.sub(r"[^a-zA-Z0-9\s]", " ", raw)
-        # Collapse whitespace and split into tokens
+        # Strip the characters that carry FTS5 syntax or are ASCII
+        # control codepoints. Every other character — Unicode letters and
+        # digits of any script — passes through as part of a token. We do
+        # NOT collapse consecutive whitespace here; the split() below
+        # already does that.
+        #
+        # We avoid the ``\p{C}`` Unicode-property class because the
+        # stdlib ``re`` module does not support it (that syntax is in the
+        # third-party ``regex`` module). The explicit character class
+        # below covers the same categories the sanitizer actually needs to
+        # block: the six FTS5 syntax characters, the ASCII C0 control
+        # range, DEL, the most common zero-width / format codepoints
+        # (ZWJ, ZWNJ, LRM, RLM, ZWSP, BOM), and the surrogate/private-use
+        # range. Other Unicode ``Cf``/``Co`` codepoints are rare enough
+        # in user input that blocking them here would be a surprise.
+        cleaned = _re.sub(
+            r'["()*:^]'
+            r"|[\x00-\x1f\x7f]"  # C0 controls + DEL
+            r"|[\u200b-\u200f\u2028-\u202f\u2060-\u206f\ufeff\ufff9-\ufffb]"  # common Cf
+            r"|[\ue000-\uf8ff]",  # private-use area (Co)
+            " ",
+            raw,
+        )
         tokens = cleaned.split()
         if not tokens:
             return '""'
-        # Wrap each token in double-quotes for literal matching
+        # Wrap each token in double-quotes for literal matching.
         return " ".join(f'"{t}"' for t in tokens[:20])  # cap at 20 terms
 
     async def search_transcript(
