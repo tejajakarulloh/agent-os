@@ -44,10 +44,7 @@ class ProviderBuildError(Exception):
 
 
 def _unsupported_runtime_message(provider: str) -> str:
-    return (
-        f"Provider '{provider}' is registered but runtime support "
-        "is not enabled in this wave"
-    )
+    return f"Provider '{provider}' is registered but runtime support is not enabled in this wave"
 
 
 def _missing_base_url_message(provider: str) -> str:
@@ -262,8 +259,16 @@ class ModelSelector:
         self._index = self._first_admitted_index(start)
         return _build_provider(self._chain[self._index])
 
-    def override_model(self, model: str) -> None:
-        """Update the model on the primary provider config (for runtime switching)."""
+    def override_model(
+        self,
+        model: str,
+        fallbacks: list[ProviderConfig] | None = None,
+    ) -> None:
+        """Update the model on the primary provider config (for runtime switching).
+
+        When ``fallbacks`` is provided, the selector's fallback chain is also updated
+        (e.g. candidate router tier models that can be tried if the primary fails).
+        """
         if model and model != self._chain[0].model:
             self._chain[0] = ProviderConfig(
                 provider=self._chain[0].provider,
@@ -274,6 +279,9 @@ class ModelSelector:
                 proxy=self._chain[0].proxy,
                 provider_routing=self._chain[0].provider_routing,
             )
+        if fallbacks is not None:
+            self._config.fallbacks = list(fallbacks)
+            self._chain = [self._chain[0], *fallbacks]
 
     def sync_primary(self, cfg: ProviderConfig) -> None:
         """Replace the primary provider config for future resolves and clones."""
