@@ -739,8 +739,8 @@ class SessionStorage:
             await self.conn.rollback()
             raise
 
-    async def prune_stale_sessions(self, before_ms: int) -> int:
-        """Delete sessions not updated since before_ms epoch ms. Returns count deleted."""
+    async def prune_stale_sessions(self, before_ms: int) -> list[str]:
+        """Delete sessions not updated since before_ms epoch ms. Returns deleted keys."""
         async with self.conn.execute(
             "SELECT session_key FROM sessions WHERE updated_at < ?",
             (before_ms,),
@@ -749,7 +749,7 @@ class SessionStorage:
         session_keys = [row[0] for row in rows]
         for session_key in session_keys:
             await self.delete_session(session_key)
-        return len(session_keys)
+        return session_keys
 
     async def count_sessions(self) -> int:
         async with self.conn.execute("SELECT COUNT(*) FROM sessions") as cur:

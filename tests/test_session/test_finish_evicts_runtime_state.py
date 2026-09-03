@@ -108,11 +108,11 @@ async def test_cap_entries_and_prune_stale_evict_runtime_state() -> None:
             self._sessions.pop(session_key, None)
             return True
 
-        async def prune_stale_sessions(self, before_ms: int) -> int:
+        async def prune_stale_sessions(self, before_ms: int) -> list[str]:
             stale = [k for k, s in self._sessions.items() if s.updated_at < before_ms]  # type: ignore[attr-defined]
             for k in stale:
                 await self.delete_session(k)
-            return len(stale)
+            return stale
 
     storage = _MaintenanceStorage()
     for i in range(3):
@@ -143,3 +143,65 @@ async def test_cap_entries_and_prune_stale_evict_runtime_state() -> None:
     assert pruned == 2
     assert not _tracker.is_closed("agent:main:s-1", "task-1")
     assert not _tracker.is_closed("agent:main:s-2", "task-2")
+
+
+@pytest.mark.asyncio
+async def test_sessions_delete_rpc_cancels_and_evicts() -> None:
+    """sessions.delete RPC cancels tasks and evicts runtime state."""
+    from dataclasses import dataclass, field
+
+    from agentos.session.models import SessionNode
+
+    class _RpcDeleteStorage(_MemoryStorage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.deleted_keys: list[str] = []
+
+        async def delete_session(self, session_key: str) -> bool:
+            self.deleted_keys.append(session_key)
+            self._sessions.pop(session_key, None)
+            return True
+
+    @dataclass
+    class _FakeTaskRuntime:
+        cancelled: list[str] = field(default_factory=list)
+
+        async def cancel(
+            self, *, session_key: str, source: str = "", reason: str = ""
+        ) -> int:
+            self.cancelled.append(session_key)
+            return 0
+
+    storage = _RpcDeleteStorage()
+    node = SessionNode(
+        session_key="agent:main:rpc-del",
+        session_id="rpc-1",
+        agent_id="main",
+        created_at=1,
+        updated_at=1,
+        started_at=1,
+        status=SessionStatus.RUNNING,
+    )
+    await storage.upsert_session(node)
+
+    _tracker.mark_closed("agent:main:rpc-del", "task-rpc")
+    _history_store.set("agent:main:rpc-del", [{"turn_index": 0}])
+
+    task_runtime = _FakeTaskRuntime()
+    mgr = SessionManager(storage, task_runtime=task_runtime)  # type: ignore[arg-type]
+
+    # Simulate what _handle_sessions_delete does: cancel tasks then delete
+    from agentos.gateway.rpc_sessions import _cancel_task_runtime
+
+    await _cancel_task_runtime(
+        task_runtime,
+        session_key="agent:main:rpc-del",
+        source="sessions_delete",
+        reason="session_deleted",
+    )
+    await mgr.delete("agent:main:rpc-del")
+
+    assert "agent:main:rpc-del" in task_runtime.cancelled
+    assert not _tracker.is_closed("agent:main:rpc-del", "task-rpc")
+    assert _history_store.get("agent:main:rpc-del") is None
+    assert "agent:main:rpc-del" in storage.deleted_keys
