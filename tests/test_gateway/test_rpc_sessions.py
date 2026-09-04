@@ -14,6 +14,7 @@ import pytest
 
 from agentos.agents.registry import AgentRegistry
 from agentos.attachment_refs import transcript_material_path
+from agentos.engine.steps.agentos_router import _history_store
 from agentos.engine.types import DoneEvent, ErrorEvent
 from agentos.gateway import rpc_chat, rpc_sessions
 from agentos.gateway.access import ConnectionSurface
@@ -28,9 +29,11 @@ from agentos.gateway.input_normalization import LARGE_PASTE_CHARS, estimate_text
 from agentos.gateway.rpc import RpcContext, get_dispatcher
 from agentos.gateway.rpc_sessions import _normalize_terminal_event_payload
 from agentos.gateway.session_streams import get_session_streams
+from agentos.gateway.subagent_announce import _tracker
 from agentos.gateway.uploads import set_upload_store
 from agentos.gateway.websocket import SubscriptionManager, get_registry
 from agentos.session.compaction import CompactionConfig
+from agentos.session.manager import SessionManager
 
 
 @dataclass
@@ -207,6 +210,9 @@ class FakeSessionManager:
             agent_id=agent_id,
             display_name=display_name,
         )
+
+    async def delete(self, key: str) -> None:
+        await self._storage.delete_session(key)
 
     async def get_transcript(self, key: str) -> list:
         return list(self.transcript)
@@ -2005,6 +2011,46 @@ class TestSessionsDelete:
         assert res.ok is True
         assert res.payload["deleted"] == []
         assert len(res.payload["errors"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_cancels_tasks_and_evicts_runtime_state(self, dispatcher, session):
+        class Runtime:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            async def cancel(
+                self,
+                session_key: str | None = None,
+                source: str | None = None,
+                reason: str | None = None,
+            ) -> int:
+                self.calls.append({"session_key": session_key, "source": source, "reason": reason})
+                return 1
+
+        runtime = Runtime()
+        manager = SessionManager(FakeStorage([session]))  # type: ignore[arg-type]
+        ctx = make_ctx(session_manager=manager, task_runtime=runtime)
+
+        _tracker.mark_closed(session.session_key, "task-rpc")
+        _history_store.set(session.session_key, [{"turn_index": 0}])
+        assert _tracker.is_closed(session.session_key, "task-rpc")
+        assert _history_store.get(session.session_key) is not None
+
+        res = await dispatcher.dispatch("r1", "sessions.delete", {"key": session.session_key}, ctx)
+
+        assert res.ok is True
+        assert res.payload["deleted"] == [session.session_key]
+        assert res.payload["errors"] == []
+        assert runtime.calls == [
+            {
+                "session_key": session.session_key,
+                "source": "sessions_delete",
+                "reason": "session_deleted",
+            }
+        ]
+        assert not _tracker.is_closed(session.session_key, "task-rpc")
+        assert _history_store.get(session.session_key) is None
+        assert await manager.storage.get_session(session.session_key) is None
 
 
 class TestSessionsCompact:
