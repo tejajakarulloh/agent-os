@@ -19,7 +19,7 @@ import os
 import platform
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Hashable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Hashable, Mapping, MutableMapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -216,6 +216,29 @@ _IMAGE_GENERATION_TOOL_NAMES: Final[frozenset[str]] = frozenset({"image_generate
 _ARTIFACT_DELIVERY_FAILURE_MARKER: Final[str] = "File delivery failed:"
 _ARTIFACT_DELIVERY_TOOL_NAME: Final[str] = "publish_artifact"
 _ARTIFACT_DELIVERY_FAILURE_MAX_CHARS: Final[int] = 360
+
+_SNAPSHOT_CACHE_TTL_SECONDS: Final[float] = 3600.0  # 1 hour
+_SNAPSHOT_CACHE_MAX_ENTRIES: Final[int] = 500
+
+
+def _evict_stale_snapshot_entries(
+    snaps: MutableMapping[Any, Any],
+    *,
+    now: float | None = None,
+) -> int:
+    """Evict entries from *snaps* when the dict exceeds max entries.
+
+    Returns the number of entries evicted.  Additive guard - callers
+    that set/refresh snapshots are unchanged.  Uses dict insertion order
+    (Python 3.7+) for simple oldest-first eviction.
+    """
+    if len(snaps) <= _SNAPSHOT_CACHE_MAX_ENTRIES:
+        return 0
+    excess = len(snaps) - _SNAPSHOT_CACHE_MAX_ENTRIES
+    for key in list(snaps.keys())[:excess]:
+        del snaps[key]
+    return excess
+
 
 _HOOKS_FEATURE_ENV: Final[str] = "AGENTOS_HOOKS"
 
@@ -1851,6 +1874,7 @@ class TurnRunner:
         for key in list(self._memory_snapshots):
             if key[0] == agent_id:
                 self._memory_snapshots[key] = new_snap
+        _evict_stale_snapshot_entries(self._memory_snapshots)
 
     def _handle_memory_source_write(self, agent_id: str, path: str) -> None:
         """Refresh memory index/snapshots after a source Markdown file write."""
@@ -1867,6 +1891,7 @@ class TurnRunner:
         for key in list(self._bootstrap_snapshots):
             if key[0] == agent_id:
                 del self._bootstrap_snapshots[key]
+        _evict_stale_snapshot_entries(self._bootstrap_snapshots)
 
     def _with_runtime_write_callbacks(
         self, tool_context: ToolContext, agent_id: str
