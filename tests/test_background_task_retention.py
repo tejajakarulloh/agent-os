@@ -304,3 +304,106 @@ async def test_tui_runtime_cancel_retains_abort_task() -> None:
     turn_hang.set()
     input_queue.put_nowait(None)
     await runtime_task
+
+
+@pytest.mark.asyncio
+async def test_otlp_write_flush_retains_task() -> None:
+    from agentos.observability.otlp import OtlpTraceSink
+    from agentos.observability.trace import TraceContext, TraceEvent
+
+    sink = OtlpTraceSink(
+        endpoint="http://localhost:4318",
+        batch_size=1,
+        flush_interval_s=0,
+    )
+
+    unblock = asyncio.Event()
+    started = asyncio.Event()
+
+    async def fake_flush() -> bool:
+        started.set()
+        await unblock.wait()
+        return True
+
+    sink.flush = fake_flush  # type: ignore[method-assign]
+
+    ctx = TraceContext.new(
+        trace_id="4bf92f3577b34da6a3ce929d0e0e4736",
+        session_key="sess-test",
+    )
+    event = TraceEvent(kind="llm_call", context=ctx)
+
+    sink.write(event)
+    await started.wait()
+
+    assert len(sink._background_tasks) == 1
+    task = next(iter(sink._background_tasks))
+    assert not task.done()
+
+    unblock.set()
+    await task
+    await asyncio.sleep(0)
+    assert len(sink._background_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_otlp_close_cancels_background_tasks() -> None:
+    from agentos.observability.otlp import OtlpTraceSink
+    from agentos.observability.trace import TraceContext, TraceEvent
+
+    sink = OtlpTraceSink(
+        endpoint="http://localhost:4318",
+        batch_size=1,
+        flush_interval_s=0,
+    )
+
+    started = asyncio.Event()
+
+    async def fake_flush() -> bool:
+        started.set()
+        await asyncio.sleep(100)
+        return True
+
+    sink.flush = fake_flush  # type: ignore[method-assign]
+
+    ctx = TraceContext.new(
+        trace_id="4bf92f3577b34da6a3ce929d0e0e4736",
+        session_key="sess-test",
+    )
+    event = TraceEvent(kind="llm_call", context=ctx)
+
+    sink.write(event)
+    await started.wait()
+
+    assert len(sink._background_tasks) == 1
+    task = next(iter(sink._background_tasks))
+    assert not task.done()
+
+    await sink.close()
+    assert len(sink._background_tasks) == 0
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_retain_task_helper() -> None:
+    from agentos.asyncio_utils import _BACKGROUND_TASKS, retain_task
+
+    tasks: set[asyncio.Task[Any]] = set()
+
+    async def sample_coro() -> None:
+        await asyncio.sleep(0.01)
+
+    t = asyncio.create_task(sample_coro())
+    retain_task(t, tasks)
+    assert t in tasks
+    await t
+    await asyncio.sleep(0)
+    assert t not in tasks
+
+    # Test default module-level set
+    t2 = asyncio.create_task(sample_coro())
+    retain_task(t2)
+    assert t2 in _BACKGROUND_TASKS
+    await t2
+    await asyncio.sleep(0)
+    assert t2 not in _BACKGROUND_TASKS
