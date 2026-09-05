@@ -102,8 +102,14 @@ class VideoMerger:
             video_path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        width, height, duration = result.stdout.strip().split("\n")[:3]
-        return int(width), int(height), float(duration)
+        parts = result.stdout.strip().split("\n")
+        width = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
+        height = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        try:
+            duration = float(parts[2]) if len(parts) > 2 else 0.0
+        except ValueError:
+            duration = 0.0
+        return width, height, duration
 
     def merge(self,
               input_dir: str,
