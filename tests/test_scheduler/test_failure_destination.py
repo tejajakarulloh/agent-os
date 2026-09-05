@@ -11,10 +11,10 @@ persistence, RPC, and the actual failure-routing decision.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from agentos.gateway.rpc import RpcContext
@@ -496,9 +496,9 @@ async def test_dispatcher_exception_does_not_break_state_machine() -> None:
 
 async def test_dispatch_failure_alert_via_webhook(monkeypatch) -> None:
     _RecordingHttpxClient.posts.clear()
-    monkeypatch.setitem(
-        sys.modules, "httpx", type("M", (), {"AsyncClient": _RecordingHttpxClient})
-    )
+    # ``ssrf_guarded_client`` constructs through ``httpx.AsyncClient`` so a
+    # double patched onto that attribute still stands in for the real client.
+    monkeypatch.setattr(httpx, "AsyncClient", _RecordingHttpxClient)
 
     chain = DeliveryChain()
     job = _job_with_delivery(

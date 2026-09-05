@@ -116,6 +116,10 @@ one-shot warning without stopping the turn. Spend is persisted to
 Per-agent and per-channel ceilings use `[budgets.agent_daily_limit]` and
 `[budgets.channel_daily_limit]`.
 
+Each admitted turn also holds `budgets.turn_reservation` dollars (default
+`0.25`) of headroom until it ends, so a concurrent subagent fan-out cannot
+clear one ceiling several times over against the same snapshot.
+
 See [`configuration.md`](configuration.md#spend-budgets) for the full key list.
 
 ## Notes and Limits

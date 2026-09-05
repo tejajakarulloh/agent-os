@@ -144,6 +144,7 @@ from agentos.provider import (
 )
 from agentos.provider import (
     ProviderFailureKind,
+    ProviderHeartbeatEvent,
     ProviderRecoveryAction,
     classify_provider_error,
     decide_recovery_action,
@@ -1096,6 +1097,24 @@ def _drop_unpaired_tool_use_segments(segments: list[dict[str, Any]]) -> list[dic
     ]
 
 
+def _selector_model_name(provider: Any, selector: Any) -> str:
+    m = getattr(provider, "_model", None) or getattr(provider, "model", None)
+    if not m:
+        cfg = getattr(selector, "current_config", None)
+        m = getattr(cfg, "model", "") if cfg is not None else ""
+    return str(m or "")
+
+
+def _selector_has_fallback(selector: Any) -> bool:
+    fn = getattr(selector, "has_fallback", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+    return False
+
+
 class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors.
 
@@ -1179,6 +1198,7 @@ class _SelectorFallbackProvider:
                     recorded_failure = trips_breaker(kind)
                     self._record_failure(kind, event.message)
                 if _kind_uses_selector_fallback(kind):
+                    failed_model = _selector_model_name(self._provider, self._selector)
                     try:
                         self._provider = self._selector.next_fallback_after_failure(
                             RuntimeError(event.message)
@@ -1188,6 +1208,14 @@ class _SelectorFallbackProvider:
                             yield buffered_event
                         yield event
                         return
+                    fallback_model = _selector_model_name(self._provider, self._selector)
+                    yield ProviderHeartbeatEvent(
+                        phase="llm_fallback",
+                        message=(
+                            f"Model {failed_model or 'primary'} failed; "
+                            f"automatically switching to fallback model {fallback_model}."
+                        ),
+                    )
                     async for fallback_event in self._fallback_chat(messages, tools, config):
                         yield fallback_event
                     return
@@ -1239,6 +1267,25 @@ class _SelectorFallbackProvider:
                     kind = _classify_provider_event(self.provider_name, event)
                     recorded_failure = trips_breaker(kind)
                     self._record_failure(kind, event.message)
+                if _kind_uses_selector_fallback(kind) and _selector_has_fallback(self._selector):
+                    failed_model = _selector_model_name(self._provider, self._selector)
+                    try:
+                        self._provider = self._selector.next_fallback_after_failure(
+                            RuntimeError(event.message)
+                        )
+                        fallback_model = _selector_model_name(self._provider, self._selector)
+                        yield ProviderHeartbeatEvent(
+                            phase="llm_fallback",
+                            message=(
+                                f"Model {failed_model or 'fallback'} failed; "
+                                f"automatically switching to fallback model {fallback_model}."
+                            ),
+                        )
+                        async for next_ev in self._fallback_chat(messages, tools, config):
+                            yield next_ev
+                        return
+                    except Exception:
+                        pass
             elif not recorded_success and (
                 _is_non_empty_provider_text_delta(event)
                 or (getattr(event, "kind", "") == "done" and not saw_provider_error)
@@ -1505,6 +1552,80 @@ def _claims_image_without_tool_use(
         return False
     lowered = final_text.lower()
     return any(p.lower() in lowered for p in _IMAGE_CLAIM_PATTERNS)
+
+
+def _derive_router_tier_fallbacks(
+    turn: TurnContext,
+    cloned_selector: Any,
+) -> list[Any] | None:
+    """Derive fallback provider configs from the router's active tiers.
+
+    When Auto Pilot selects a model for a turn, other configured text tiers in the
+    active profile serve as automatic failovers if the routed model fails (e.g.
+    times out or encounters upstream errors).
+    """
+    if not turn.metadata.get("routing_applied"):
+        return None
+    routed_tier = turn.metadata.get("routed_tier")
+    if not routed_tier:
+        return None
+    router_cfg = getattr(turn.config, "agentos_router", None)
+    if router_cfg is None or not getattr(router_cfg, "enabled", False):
+        return None
+    tiers = getattr(router_cfg, "tiers", None)
+    if not isinstance(tiers, dict) or not tiers:
+        return None
+
+    tier_preferences = {
+        "c0": ["c1", "c2", "c3"],
+        "c1": ["c2", "c0", "c3"],
+        "c2": ["c1", "c3", "c0"],
+        "c3": ["c2", "c1", "c0"],
+    }
+    preferred_order = tier_preferences.get(str(routed_tier).lower(), ["c1", "c2", "c0", "c3"])
+    candidate_tiers = [t for t in preferred_order if t in tiers and t != routed_tier]
+    for t in tiers:
+        if t not in candidate_tiers and t != routed_tier:
+            candidate_tiers.append(t)
+
+    primary_cfg = getattr(cloned_selector, "current_config", None)
+    if primary_cfg is None and hasattr(cloned_selector, "_chain") and cloned_selector._chain:
+        primary_cfg = cloned_selector._chain[0]
+    if primary_cfg is None:
+        return None
+
+    from agentos.provider.selector import ProviderConfig
+
+    fallbacks: list[ProviderConfig] = []
+    seen_models: set[str] = {turn.model or primary_cfg.model}
+
+    for tier_name in candidate_tiers:
+        tier_data = tiers.get(tier_name)
+        if not isinstance(tier_data, dict):
+            continue
+        if tier_data.get("image_only"):
+            continue
+        candidate_model = tier_data.get("model")
+        if not candidate_model or candidate_model in seen_models:
+            continue
+        seen_models.add(candidate_model)
+
+        candidate_provider = str(
+            tier_data.get("provider") or getattr(primary_cfg, "provider", "") or ""
+        )
+        fallbacks.append(
+            ProviderConfig(
+                provider=candidate_provider,
+                model=candidate_model,
+                api_key=getattr(primary_cfg, "api_key", ""),
+                base_url=getattr(primary_cfg, "base_url", ""),
+                org_id=getattr(primary_cfg, "org_id", ""),
+                proxy=getattr(primary_cfg, "proxy", ""),
+                provider_routing=getattr(primary_cfg, "provider_routing", {}),
+            )
+        )
+
+    return fallbacks if fallbacks else None
 
 
 class TurnRunner:
@@ -2546,7 +2667,14 @@ class TurnRunner:
         # Checked before any provider work so a runaway loop or fan-out stops
         # costing money at the ceiling rather than one turn past it. Subagent
         # turns run through this same path, so a fan-out is bounded too.
-        budget_stop, budget_message = self._check_spend_budget(session_key)
+        #
+        # Admission both checks and *reserves*: spend is recorded only as a
+        # turn burns tokens, so checking alone would let every child of a
+        # concurrent fan-out clear the same ceiling against the same
+        # pre-fan-out snapshot. The reservation is released in the `finally`
+        # below, on every exit path, so a failed or cancelled turn does not
+        # hold headroom it never spent.
+        budget_stop, budget_message, budget_reservation = self._reserve_spend_budget(session_key)
         if budget_stop:
             # The refusal hinges on the decision, never on the presentation
             # string: a tracker that reports a stop without a message must
@@ -2579,12 +2707,12 @@ class TurnRunner:
             await self._persist_turn_error(session_key, budget_error)
             yield budget_error
             return
-        if budget_message:
-            yield self._handle_runtime_warning(
-                WarningEvent(code="budget_warning", message=budget_message)
-            )
 
         try:
+            if budget_message:
+                yield self._handle_runtime_warning(
+                    WarningEvent(code="budget_warning", message=budget_message)
+                )
             input_out = await self._input_stage.run(
                 InputStageInput(
                     message=message,
@@ -3154,6 +3282,12 @@ class TurnRunner:
                 )
             yield ErrorEvent(message=error_message, code=event_code)
 
+        finally:
+            # Success, error, cancellation, and an abandoned generator all land
+            # here. A reservation that outlived its turn would permanently
+            # shrink the ceiling for everyone else.
+            self._release_spend_budget(budget_reservation)
+
     @staticmethod
     def _write_trace_event(
         kind: str,
@@ -3316,6 +3450,49 @@ class TurnRunner:
             )
             return False, None
         return bool(hard_stop), message
+
+    def _reserve_spend_budget(self, session_key: str) -> tuple[bool, str | None, str | None]:
+        """Admit this turn against ``[budgets]`` and hold headroom for it.
+
+        Returns ``(hard_stop, message, reservation_id)``. Like the plain check,
+        this fails open: a tracker that cannot reserve must not be the reason a
+        turn is refused. A tracker without the reservation API (older builds,
+        and the stub trackers tests use) falls back to the check-only gate,
+        which is the pre-reservation behaviour rather than an error.
+        """
+        tracker = self._usage_tracker
+        if tracker is None:
+            return False, None, None
+        budgets = getattr(self._config, "budgets", None) if self._config else None
+        if budgets is None:
+            return False, None, None
+        reserve = getattr(tracker, "reserve_turn_budget", None)
+        if not callable(reserve):
+            hard_stop, message = self._check_spend_budget(session_key)
+            return hard_stop, message, None
+        try:
+            hard_stop, message, reservation_id = reserve(session_key, budgets)
+        except Exception as exc:  # noqa: BLE001 - budget checks must fail open
+            log.warning(
+                "turn_runner.budget_reserve_failed",
+                session_key=session_key,
+                error=str(exc),
+            )
+            return False, None, None
+        return bool(hard_stop), message, reservation_id
+
+    def _release_spend_budget(self, reservation_id: str | None) -> None:
+        """Give back the headroom held by :py:meth:`_reserve_spend_budget`."""
+        if not reservation_id:
+            return
+        tracker = self._usage_tracker
+        release = getattr(tracker, "release_turn_budget", None) if tracker is not None else None
+        if not callable(release):
+            return
+        try:
+            release(reservation_id)
+        except Exception as exc:  # noqa: BLE001 - a stuck release must not fail the turn
+            log.warning("turn_runner.budget_release_failed", error=str(exc))
 
     def _handle_runtime_warning(self, event: WarningEvent) -> WarningEvent:
         return event
@@ -4634,7 +4811,11 @@ class TurnRunner:
 
         # Apply routed model back to cloned selector (local, not shared)
         if turn.model and cloned_selector is not None:
-            cloned_selector.override_model(turn.model)
+            tier_fallbacks = _derive_router_tier_fallbacks(turn, cloned_selector)
+            try:
+                cloned_selector.override_model(turn.model, fallbacks=tier_fallbacks)
+            except TypeError:
+                cloned_selector.override_model(turn.model)
             provider = cloned_selector.resolve()
 
         return turn, provider

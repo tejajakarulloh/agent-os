@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -18,6 +19,17 @@ from agentos.session.keys import normalize_agent_id
 from .pricing import calculate_cost_usd, lookup_price
 
 log = structlog.get_logger(__name__)
+
+DEFAULT_TURN_RESERVATION_USD = 0.25
+"""Headroom held for one in-flight turn when no ``turn_reservation`` is set.
+
+Sized as "one expensive turn": large enough that a concurrent fan-out cannot
+all clear the same ceiling, small enough that it only ever bites within a
+quarter of a dollar of a configured limit.
+"""
+
+_PENDING_EPSILON = 1e-9
+"""Below this, a released reservation's float dust is treated as zero."""
 
 
 def parse_session_key_scope(session_key: str) -> tuple[str, str]:
@@ -53,6 +65,32 @@ def _scope_ceiling(config: Any, field: str, scope_id: str) -> float | None:
         return None
     amount = mapping.get(scope_id)
     return float(amount) if amount is not None else None
+
+
+@dataclass(frozen=True)
+class _BudgetCheck:
+    """One configured ceiling, resolved against the current ledger state."""
+
+    scope: str
+    """Log-event scope name (``session``, ``daily``, ``agent_daily``, ...)."""
+
+    label: str
+    """Operator-facing scope name used in the refusal or warning sentence."""
+
+    warn_key: str
+    """Dedupe key so a warning fires once per scope per day/session."""
+
+    pending_key: tuple[str, str]
+    """``(scope_kind, scope_id)`` this scope's in-flight reservations book to."""
+
+    spend: float
+    """Recorded spend for this scope, in dollars."""
+
+    limit: float | None
+    """Hard ceiling, or None when only a warn threshold is configured."""
+
+    warn: float | None
+    """Warn threshold, or None when only a hard ceiling is configured."""
 
 
 _current_usage_scope: ContextVar[str | None] = ContextVar(
@@ -404,6 +442,12 @@ class UsageTracker:
         self._daily_spend_day = ""
         self._session_spend: dict[str, float] = {}
         self._session_active_skill: dict[str, str] = {}
+        # Headroom held for turns that have been admitted but have not yet
+        # recorded their spend. Without it every member of a concurrent
+        # fan-out reads the same pre-fan-out snapshot and clears the same
+        # ceiling. Keyed by ledger scope, mirroring the spend it stands in for.
+        self._pending_spend: dict[tuple[str, str], float] = {}
+        self._reservations: dict[str, tuple[float, tuple[tuple[str, str], ...]]] = {}
         _global_usage_tracker = self
 
         if self._db_path:
@@ -590,29 +634,136 @@ class UsageTracker:
         breached ceiling is never masked by a warning from an earlier scope.
         Warnings fire at most once per scope per day/session so a long-running
         session does not repeat the same alert on every turn.
+
+        This weighs recorded spend only. Turn *admission* goes through
+        :py:meth:`reserve_turn_budget`, which also counts headroom held by
+        turns already in flight; the re-check between iterations inside a turn
+        stays on this method so a turn is never stopped by its own reservation.
+        """
+        checks = self._budget_checks(session_key, config)
+        breach = self._first_breached_ceiling(session_key, checks, count_pending=False)
+        if breach is not None:
+            return True, breach
+        return False, self._first_warning(session_key, checks)
+
+    def reserve_turn_budget(
+        self,
+        session_key: str,
+        config: Any,
+        *,
+        estimate: float | None = None,
+    ) -> tuple[bool, str | None, str | None]:
+        """Admit one turn against the ceilings and hold headroom for it.
+
+        Spend only lands in the ledger via :py:meth:`add` *while* a turn burns
+        tokens, so a plain check-then-act gate lets every member of a
+        concurrent subagent fan-out read the same pre-fan-out snapshot and
+        clear the same ceiling — overshoot then scales with fan-out width
+        rather than with one turn's cost. Admission therefore reserves an
+        estimate of one turn's cost against every scope the session bills to,
+        and each sibling admitted afterwards sees that reservation.
+
+        The check and the reservation happen inside this one synchronous call,
+        so no ``await`` can interleave between them and no sibling can be
+        admitted against a snapshot that predates an already-admitted turn.
+
+        Returns ``(hard_stop, message, reservation_id)``. ``reservation_id`` is
+        None when nothing was held — a refused turn, budgets switched off, no
+        ceiling configured, or a zero estimate. When it is not None the caller
+        **must** hand it to :py:meth:`release_turn_budget` on every exit path,
+        including error and cancellation, or the headroom is held forever.
+        """
+        checks = self._budget_checks(session_key, config)
+        if not checks:
+            # No ceiling is configured, so there is nothing for a reservation
+            # to protect and no reason to pay for the bookkeeping.
+            return False, None, None
+        breach = self._first_breached_ceiling(session_key, checks, count_pending=True)
+        if breach is not None:
+            return True, breach, None
+        message = self._first_warning(session_key, checks)
+        amount = self._reservation_estimate(config) if estimate is None else float(estimate)
+        return False, message, self._hold_reservation(session_key, amount)
+
+    def release_turn_budget(self, reservation_id: str | None) -> None:
+        """Free headroom held by :py:meth:`reserve_turn_budget`.
+
+        Idempotent and total: None, an unknown id, or a second release are all
+        no-ops rather than errors, so a caller's ``finally`` never has to guard
+        the call or track whether it already ran.
+        """
+        if not reservation_id:
+            return
+        held = self._reservations.pop(reservation_id, None)
+        if held is None:
+            return
+        amount, pending_keys = held
+        for key in pending_keys:
+            remaining = self._pending_spend.get(key, 0.0) - amount
+            if remaining > _PENDING_EPSILON:
+                self._pending_spend[key] = remaining
+            else:
+                # Float subtraction leaves dust; dropping the key keeps the
+                # map from growing one stale entry per scope forever.
+                self._pending_spend.pop(key, None)
+
+    def held_headroom(self, scope_kind: str, scope_id: str) -> float:
+        """Return headroom currently reserved for in-flight turns on one scope."""
+        return self._pending_spend.get((scope_kind, scope_id), 0.0)
+
+    @staticmethod
+    def _reservation_estimate(config: Any) -> float:
+        """One turn's assumed cost, in dollars. Never negative."""
+        raw = getattr(config, "turn_reservation", None)
+        if raw is None:
+            return DEFAULT_TURN_RESERVATION_USD
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return DEFAULT_TURN_RESERVATION_USD
+
+    def _hold_reservation(self, session_key: str, amount: float) -> str | None:
+        """Book ``amount`` against every ledger scope this session bills to."""
+        if amount <= 0.0:
+            return None
+        agent_id, channel = self.get_session_scope(session_key)
+        pending_keys = (
+            ("session", session_key),
+            ("gateway", "global"),
+            ("agent", agent_id),
+            ("channel", channel),
+        )
+        for key in pending_keys:
+            self._pending_spend[key] = self._pending_spend.get(key, 0.0) + amount
+        reservation_id = uuid.uuid4().hex
+        self._reservations[reservation_id] = (amount, pending_keys)
+        return reservation_id
+
+    def _budget_checks(self, session_key: str, config: Any) -> list[_BudgetCheck]:
+        """Build one entry per ceiling that ``config`` actually configures.
+
+        Spend is only read for scopes that have a ceiling, so the default
+        all-None config costs four ``getattr`` pairs and no SQLite queries.
         """
         if config is None or not getattr(config, "enabled", True):
-            return False, None
+            return []
 
         agent_id, channel = self.get_session_scope(session_key)
         day = datetime.now(UTC).strftime("%Y-%m-%d")
-
-        # (log_event, label, warn_key, spend, limit, warn). Spend is only read
-        # for scopes that actually have a ceiling configured, so the default
-        # all-None config costs four dict lookups and no SQLite queries.
-        checks: list[tuple[str, str, str, float, float | None, float | None]] = []
+        checks: list[_BudgetCheck] = []
 
         session_limit = getattr(config, "session_limit", None)
         session_warn = getattr(config, "session_warn", None)
         if session_limit is not None or session_warn is not None:
             checks.append(
-                (
-                    "session",
-                    "Session cost",
-                    f"session:{session_key}",
-                    self.get_effective_session_cost(session_key),
-                    session_limit,
-                    session_warn,
+                _BudgetCheck(
+                    scope="session",
+                    label="Session cost",
+                    warn_key=f"session:{session_key}",
+                    pending_key=("session", session_key),
+                    spend=self.get_effective_session_cost(session_key),
+                    limit=session_limit,
+                    warn=session_warn,
                 )
             )
 
@@ -620,13 +771,14 @@ class UsageTracker:
         daily_warn = getattr(config, "daily_warn", None)
         if daily_limit is not None or daily_warn is not None:
             checks.append(
-                (
-                    "daily",
-                    "Daily gateway cost",
-                    f"daily:{day}",
-                    self.get_spend(day, "gateway", "global"),
-                    daily_limit,
-                    daily_warn,
+                _BudgetCheck(
+                    scope="daily",
+                    label="Daily gateway cost",
+                    warn_key=f"daily:{day}",
+                    pending_key=("gateway", "global"),
+                    spend=self.get_spend(day, "gateway", "global"),
+                    limit=daily_limit,
+                    warn=daily_warn,
                 )
             )
 
@@ -634,13 +786,14 @@ class UsageTracker:
         agent_warn = _scope_ceiling(config, "agent_daily_warn", agent_id)
         if agent_limit is not None or agent_warn is not None:
             checks.append(
-                (
-                    "agent_daily",
-                    f"Daily cost for agent '{agent_id}'",
-                    f"agent:{day}:{agent_id}",
-                    self.get_spend(day, "agent", agent_id),
-                    agent_limit,
-                    agent_warn,
+                _BudgetCheck(
+                    scope="agent_daily",
+                    label=f"Daily cost for agent '{agent_id}'",
+                    warn_key=f"agent:{day}:{agent_id}",
+                    pending_key=("agent", agent_id),
+                    spend=self.get_spend(day, "agent", agent_id),
+                    limit=agent_limit,
+                    warn=agent_warn,
                 )
             )
 
@@ -648,49 +801,76 @@ class UsageTracker:
         channel_warn = _scope_ceiling(config, "channel_daily_warn", channel)
         if channel_limit is not None or channel_warn is not None:
             checks.append(
-                (
-                    "channel_daily",
-                    f"Daily cost for channel '{channel}'",
-                    f"channel:{day}:{channel}",
-                    self.get_spend(day, "channel", channel),
-                    channel_limit,
-                    channel_warn,
+                _BudgetCheck(
+                    scope="channel_daily",
+                    label=f"Daily cost for channel '{channel}'",
+                    warn_key=f"channel:{day}:{channel}",
+                    pending_key=("channel", channel),
+                    spend=self.get_spend(day, "channel", channel),
+                    limit=channel_limit,
+                    warn=channel_warn,
                 )
             )
 
-        for scope, label, _warn_key, spend, limit, _warn in checks:
-            if limit is not None and spend >= limit:
-                log.warning(
-                    "budget.limit_exceeded",
-                    scope=scope,
-                    session_key=session_key,
-                    spend=spend,
-                    limit=limit,
-                )
-                return (
-                    True,
-                    f"{label} ${spend:,.4f} has reached the ${limit:,.4f} budget limit.",
-                )
+        return checks
 
-        for scope, label, warn_key, spend, _limit, warn in checks:
-            if warn is None or spend < warn:
+    def _first_breached_ceiling(
+        self,
+        session_key: str,
+        checks: list[_BudgetCheck],
+        *,
+        count_pending: bool,
+    ) -> str | None:
+        """Return the refusal message for the first breached hard limit."""
+        for check in checks:
+            if check.limit is None:
                 continue
-            if warn_key in self._warned_keys:
+            held = self.held_headroom(*check.pending_key) if count_pending else 0.0
+            if check.spend + held < check.limit:
                 continue
-            self._warned_keys.add(warn_key)
+            log.warning(
+                "budget.limit_exceeded",
+                scope=check.scope,
+                session_key=session_key,
+                spend=check.spend,
+                reserved=held,
+                limit=check.limit,
+            )
+            if held > 0.0:
+                return (
+                    f"{check.label} ${check.spend:,.4f} plus ${held:,.4f} reserved for turns "
+                    f"already running has reached the ${check.limit:,.4f} budget limit."
+                )
+            return (
+                f"{check.label} ${check.spend:,.4f} has reached "
+                f"the ${check.limit:,.4f} budget limit."
+            )
+        return None
+
+    def _first_warning(self, session_key: str, checks: list[_BudgetCheck]) -> str | None:
+        """Return the first unsent warning message, weighed on recorded spend.
+
+        Reservations are deliberately not counted here: a warning names a
+        number an operator can go and look up in the ledger.
+        """
+        for check in checks:
+            if check.warn is None or check.spend < check.warn:
+                continue
+            if check.warn_key in self._warned_keys:
+                continue
+            self._warned_keys.add(check.warn_key)
             log.warning(
                 "budget.warning",
-                scope=scope,
+                scope=check.scope,
                 session_key=session_key,
-                spend=spend,
-                threshold=warn,
+                spend=check.spend,
+                threshold=check.warn,
             )
             return (
-                False,
-                f"{label} ${spend:,.4f} has reached the ${warn:,.4f} budget warning threshold.",
+                f"{check.label} ${check.spend:,.4f} has reached "
+                f"the ${check.warn:,.4f} budget warning threshold."
             )
-
-        return False, None
+        return None
 
     def add(
         self,

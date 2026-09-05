@@ -27,6 +27,27 @@ class GatewayClientLike(Protocol):
     async def recv_event(self, timeout: float | None = None) -> dict[str, Any]: ...
 
 
+# Upper bounds for the bridge arguments an MCP client supplies. The client is the
+# operator's own MCP host rather than a remote attacker, but every one of these
+# arguments is chosen by a model on each call, so a bad pick has to degrade
+# rather than hang the tool call: a `timeout_ms=3_600_000` holds the call open
+# for an hour, which the user cannot tell apart from a stuck gateway.
+#
+# The ceilings sit above this bridge's own defaults (50 sessions, 1000 messages)
+# so ordinary calls are untouched. That is why they are not the 200/100 used by
+# the `sessions_list` / `sessions_history` builtins, whose defaults are 50 and
+# 20. The gateway applies its own, tighter cap to `chat.history`, so the history
+# ceiling here is defence in depth rather than the only guard.
+_MAX_EVENTS_WAIT_TIMEOUT_MS = 300_000  # 5 minutes
+_MAX_EVENTS_WAIT_EVENTS = 10_000
+_MAX_HISTORY_LIMIT = 5_000
+_MAX_SESSION_LIST_LIMIT = 5_000
+
+
+def _clamp_limit(limit: int, upper: int) -> int:
+    return min(max(1, limit), upper)
+
+
 def _default_gateway_client() -> GatewayClientLike:
     from agentos.gateway_client import GatewayRPCClient
 
@@ -65,7 +86,10 @@ class AgentOSMCPBridge:
 
     async def conversations_list(self, limit: int = 50) -> dict[str, Any]:
         client = await self._ensure_client()
-        return await client.list_sessions(limit=limit)
+        # The lower bound matters as much as the ceiling here: `sessions.list`
+        # passes the limit into a SQL `LIMIT ?`, and SQLite reads a negative
+        # limit as no limit at all, so a negative argument loaded every row.
+        return await client.list_sessions(limit=_clamp_limit(limit, _MAX_SESSION_LIST_LIMIT))
 
     async def session_resolve(self, key: str) -> dict[str, Any]:
         client = await self._ensure_client()
@@ -73,7 +97,7 @@ class AgentOSMCPBridge:
 
     async def messages_read(self, key: str, limit: int = 1000) -> dict[str, Any]:
         client = await self._ensure_client()
-        return await client.session_history(key, limit=limit)
+        return await client.session_history(key, limit=_clamp_limit(limit, _MAX_HISTORY_LIMIT))
 
     async def messages_send(
         self,
@@ -131,8 +155,9 @@ class AgentOSMCPBridge:
             current_stream_seq = int(
                 subscription.get("current_stream_seq") or since_stream_seq or 0
             )
-            deadline = time.monotonic() + max(0, timeout_ms) / 1000
-            max_events = max(1, max_events)
+            max_events = _clamp_limit(max_events, _MAX_EVENTS_WAIT_EVENTS)
+            timeout_ms = min(max(0, timeout_ms), _MAX_EVENTS_WAIT_TIMEOUT_MS)
+            deadline = time.monotonic() + timeout_ms / 1000
 
             while len(events) < max_events:
                 remaining = deadline - time.monotonic()

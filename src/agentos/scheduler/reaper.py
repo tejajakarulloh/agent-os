@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import time
 
+from agentos.session.runtime_state import evict_session_runtime_state
+
 logger = logging.getLogger(__name__)
 
 
@@ -64,6 +66,10 @@ class SessionReaper:
             logger.warning("reaper.page_cap_reached pages=%d", self.MAX_PAGES)
 
         for key in to_delete:
+            # Same leak as the other removal paths: the reaper talks straight
+            # to storage, so the process-global runtime state keyed by session
+            # has to be dropped here too.
+            evict_session_runtime_state(key)
             await self._session_store.delete_session(key)
 
         if to_delete:

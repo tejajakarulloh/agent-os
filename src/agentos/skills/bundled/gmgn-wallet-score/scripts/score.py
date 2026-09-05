@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 import json, math, subprocess, sys
 
+if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+    print(
+        f"Usage: {sys.argv[0]} <wallet> <chain> [zh|en] [latency_s] [slippage_pct] [gas_usd] [sample]"
+    )
+    sys.exit(0)
+
+if len(sys.argv) < 3:
+    print(
+        f"Usage: {sys.argv[0]} <wallet> <chain> [zh|en] [latency_s] [slippage_pct] [gas_usd] [sample]",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
 WALLET       = sys.argv[1]
 CHAIN        = sys.argv[2]
 LANG         = sys.argv[3] if len(sys.argv) > 3 else 'zh'

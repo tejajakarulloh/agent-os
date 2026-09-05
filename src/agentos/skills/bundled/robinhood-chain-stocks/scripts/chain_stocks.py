@@ -348,20 +348,32 @@ def inspect_token(
         if isinstance(onchain_symbol, str) and onchain_symbol:
             feed = find_feed(onchain_symbol, feeds)
 
+    # `isStockToken: False` is authoritative on-chain proof that the contract
+    # is not a Stock Token (uiMultiplier reverted). Decorating a confirmed
+    # impersonator with a real company's live Chainlink price lends borrowed
+    # credibility to a fake contract. Withhold price and record the reason in
+    # readErrors per the reporting rule in SKILL.md.
     if feed is not None:
-        price = _try(
-            lambda: _read_price(rpc_url, str(feed["proxyAddress"]), timeout, now), errors, "price"
-        )
-        if price is not None:
-            heartbeat = feed.get("heartbeat")
-            price["heartbeatSeconds"] = heartbeat
-            price["deviationThresholdPercent"] = feed.get("threshold")
-            # Mark staleness in the payload instead of leaving the reader to
-            # compare a unix timestamp against the heartbeat by eye.
-            age = price.get("ageSeconds")
-            beyond = isinstance(age, int) and isinstance(heartbeat, int) and age > heartbeat
-            price["stale"] = bool(beyond or out.get("oraclePaused"))
-            out["price"] = price
+        if out.get("isStockToken") is False:
+            msg = "price withheld: contract failed the Stock Token check (isStockToken is false)"
+            errors["price"] = msg
+            out.setdefault("notes", []).append(msg)
+        else:
+            price = _try(
+                lambda: _read_price(rpc_url, str(feed["proxyAddress"]), timeout, now),
+                errors,
+                "price",
+            )
+            if price is not None:
+                heartbeat = feed.get("heartbeat")
+                price["heartbeatSeconds"] = heartbeat
+                price["deviationThresholdPercent"] = feed.get("threshold")
+                # Mark staleness in the payload instead of leaving the reader to
+                # compare a unix timestamp against the heartbeat by eye.
+                age = price.get("ageSeconds")
+                beyond = isinstance(age, int) and isinstance(heartbeat, int) and age > heartbeat
+                price["stale"] = bool(beyond or out.get("oraclePaused"))
+                out["price"] = price
 
     if holder:
         balance = _try(
@@ -378,9 +390,10 @@ def inspect_token(
                 "balance": str(balance),
                 "balanceFormatted": tokens_held,
             }
-            usd = (out.get("price") or {}).get("usd")
-            if usd is not None:
-                holding["valueUsd"] = tokens_held * usd
+            if out.get("isStockToken") is not False:
+                usd = (out.get("price") or {}).get("usd")
+                if usd is not None:
+                    holding["valueUsd"] = tokens_held * usd
             out["holding"] = holding
 
     if errors:
@@ -461,7 +474,12 @@ def main(argv: list[str] | None = None) -> int:
     state = inspect_token(
         args.rpc_url, address, args.timeout, holder=args.holder, feed=feed, feeds=feeds
     )
-    if not args.no_price and "price" not in state:
+    if (
+        not args.no_price
+        and "price" not in state
+        and "price" not in state.get("readErrors", {})
+        and state.get("isStockToken") is not False
+    ):
         # Say which of the two happened. "We could not fetch the feed list" is
         # not the same claim as "this token has no feed", and reporting the
         # first as the second asserts something the run never checked.

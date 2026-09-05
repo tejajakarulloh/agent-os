@@ -7,21 +7,30 @@ from typing import Any
 
 
 class SessionWriteLock:
-    """Async lock per session_key to serialize writes."""
+    """Async lock per session_key to serialize writes.
+
+    Entries are evicted from the internal dict as soon as the lock is fully
+    idle (released with no pending waiters), so the dict does not grow
+    unboundedly with the number of unique session keys.
+    """
 
     def __init__(self) -> None:
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def acquire(self, session_key: str) -> None:
-        """Acquire the lock for a session."""
         if session_key not in self._locks:
             self._locks[session_key] = asyncio.Lock()
         await self._locks[session_key].acquire()
 
     def release(self, session_key: str) -> None:
-        """Release the lock for a session."""
         if session_key in self._locks:
-            self._locks[session_key].release()
+            lock = self._locks[session_key]
+            # Evict if no waiter is queued: the next acquire() will create a
+            # fresh lock for this session_key.  If waiters exist, keep the entry
+            # so they can acquire the already-released lock.
+            if not lock._waiters:
+                del self._locks[session_key]
+            lock.release()
 
     async def __aenter__(self) -> SessionWriteLock:
         return self

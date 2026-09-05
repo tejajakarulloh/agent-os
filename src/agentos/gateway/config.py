@@ -24,6 +24,7 @@ from pydantic import (
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from agentos import __version__, model_registry
+from agentos.engine.usage import DEFAULT_TURN_RESERVATION_USD
 from agentos.gateway.config_migration import (
     backup_and_write_migrated_config,
     migrate_config_payload,
@@ -2059,6 +2060,15 @@ class BudgetsConfig(BaseModel):
 
     channel_daily_warn: dict[str, float] = Field(default_factory=dict)
     """Per-channel daily warn thresholds, keyed by channel name."""
+
+    turn_reservation: float = Field(default=DEFAULT_TURN_RESERVATION_USD, ge=0.0)
+    """Dollars of headroom held for a turn from the moment it is admitted
+    until it finishes, so concurrently-started turns (a subagent fan-out)
+    cannot all clear the same ceiling against a snapshot that predates every
+    one of them. It only ever bites within this much of a limit, and a
+    reservation is released the moment its turn ends, so it never shrinks the
+    ceiling for turns that run one after another. Set ``0`` to reserve
+    nothing — ceilings then bound serial turns only."""
 
     @staticmethod
     def _normalized_keys(value: Any, normalize: Any) -> Any:

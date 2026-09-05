@@ -86,7 +86,11 @@ from agentos.provider import (
 from agentos.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
-from agentos.provider.failures import ProviderFailureKind, classify_provider_error
+from agentos.provider.failures import (
+    ProviderFailureKind,
+    classify_provider_error,
+    is_transport_timeout,
+)
 from agentos.provider.types import ContentBlockImage
 from agentos.result_budget import (
     ToolResultBudgetClass,
@@ -2982,10 +2986,25 @@ class Agent:
                             )
                             _call_attempt += 1
                             continue
-                        if not _fallback.should_retry(kind, _retry_attempt):
+                        _is_timeout = is_transport_timeout(
+                            raw_code=provider_error.code,
+                            message=provider_error.message,
+                        )
+                        if not _fallback.should_retry_timeout(
+                            kind, _retry_attempt, is_timeout=_is_timeout
+                        ):
                             yield self._transition(AgentState.ERROR)
+                            _err_msg = provider_error.message
+                            if _is_timeout:
+                                _err_msg = (
+                                    f"{provider_error.message}. "
+                                    "The upstream model endpoint did not respond "
+                                    "within the timeout window. Try switching "
+                                    "to a different model tier with /c0, /c2, "
+                                    "or /auto to restore automatic routing."
+                                )
                             terminal_error = ErrorEvent(
-                                message=provider_error.message,
+                                message=_err_msg,
                                 code=provider_error.code,
                             )
                             yield terminal_error
@@ -3001,7 +3020,15 @@ class Agent:
                             attempt=_retry_attempt + 1,
                             kind=kind.value,
                             delay_s=round(delay, 2),
+                            is_timeout=_is_timeout,
                         )
+                        if _is_timeout:
+                            yield WarningEvent(
+                                code="provider_timeout_retry",
+                                message=(
+                                    "The upstream model timed out; retrying once before giving up."
+                                ),
+                            )
                         await asyncio.sleep(delay)
                         _retry_attempt += 1
                         _call_attempt += 1

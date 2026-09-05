@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 
@@ -357,12 +359,47 @@ def _parse_delivery(raw: str | None) -> DeliveryConfig:
         return DeliveryConfig()
 
 
+class _AsyncReentrantLock:
+    """Async reentrant lock bound to asyncio.current_task()."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[Any] | None = None
+        self._depth = 0
+
+    async def acquire(self) -> None:
+        current_task = asyncio.current_task()
+        if self._owner is not None and self._owner is current_task:
+            self._depth += 1
+            return
+        await self._lock.acquire()
+        self._owner = current_task
+        self._depth = 1
+
+    def release(self) -> None:
+        current_task = asyncio.current_task()
+        if self._owner is not current_task:
+            raise RuntimeError("Cannot release un-owned lock")
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
+
+
 class JobStore:
     """Async SQLite store for CronJob records."""
 
     def __init__(self, db_path: str = ":memory:") -> None:
         self._db_path = db_path
         self._conn: aiosqlite.Connection | None = None
+        self._write_lock = _AsyncReentrantLock()
+        self._in_transaction = False
 
     async def open(self) -> None:
         if self._conn is None:
@@ -602,18 +639,36 @@ class JobStore:
         )
 
     async def save(self, job: CronJob) -> None:
-        await self._execute_save(job)
-        await self._db().commit()
+        async with self._write_lock:
+            await self._execute_save(job)
+            if not self._in_transaction:
+                await self._db().commit()
 
     async def save_no_commit(self, job: CronJob) -> None:
         """Insert/update a job without committing — use inside transaction()."""
         await self._execute_save(job)
 
     @asynccontextmanager
-    async def transaction(self):
-        """Batch multiple save_no_commit() calls into a single commit."""
-        yield self
-        await self._db().commit()
+    async def transaction(self) -> AsyncIterator[JobStore]:
+        """Batch multiple save_no_commit() calls into a single commit with rollback on failure."""
+        async with self._write_lock:
+            nested = self._in_transaction
+            if not nested:
+                self._in_transaction = True
+            try:
+                yield self
+                if not nested:
+                    await self._db().commit()
+            except BaseException:
+                if not nested:
+                    try:
+                        await self._db().rollback()
+                    except Exception:
+                        pass
+                raise
+            finally:
+                if not nested:
+                    self._in_transaction = False
 
     async def get(self, job_id: str) -> CronJob | None:
         async with self._db().execute(
@@ -680,28 +735,30 @@ class JobStore:
         if require_due:
             params.append(now_iso)
 
-        cur = await self._db().execute(
-            f"""
-            UPDATE scheduler_jobs
-            SET status = ?,
-                reservation_token = ?,
-                reserved_at = ?,
-                reserved_by = ?,
-                reservation_source = ?,
-                scheduled_run_at = next_run_at,
-                last_run_at = ?,
-                updated_at = ?,
-                last_error = NULL
-            WHERE id = ?
-              AND enabled = 1
-              AND status = ?
-              AND reservation_token = ''
-              AND (backoff_until IS NULL OR backoff_until <= ?)
-              {due_predicate}
-            """,
-            [JobStatus.RUNNING.value, *params],
-        )
-        await self._db().commit()
+        async with self._write_lock:
+            cur = await self._db().execute(
+                f"""
+                UPDATE scheduler_jobs
+                SET status = ?,
+                    reservation_token = ?,
+                    reserved_at = ?,
+                    reserved_by = ?,
+                    reservation_source = ?,
+                    scheduled_run_at = next_run_at,
+                    last_run_at = ?,
+                    updated_at = ?,
+                    last_error = NULL
+                WHERE id = ?
+                  AND enabled = 1
+                  AND status = ?
+                  AND reservation_token = ''
+                  AND (backoff_until IS NULL OR backoff_until <= ?)
+                  {due_predicate}
+                """,
+                [JobStatus.RUNNING.value, *params],
+            )
+            if not self._in_transaction:
+                await self._db().commit()
 
         if cur.rowcount == 1:
             job = await self.get(job_id)
@@ -793,8 +850,10 @@ class JobStore:
         return True
 
     async def delete(self, job_id: str) -> None:
-        await self._db().execute("DELETE FROM scheduler_jobs WHERE id = ?", (job_id,))
-        await self._db().commit()
+        async with self._write_lock:
+            await self._db().execute("DELETE FROM scheduler_jobs WHERE id = ?", (job_id,))
+            if not self._in_transaction:
+                await self._db().commit()
 
     async def list_active(self) -> list[CronJob]:
         """Return all jobs that are not deleted."""
@@ -839,26 +898,28 @@ class JobStore:
             return None
 
     async def save_execution(self, execution: JobExecution) -> None:
-        await self._db().execute(
-            """
-            INSERT INTO scheduler_runs
-                (id, job_id, started_at, finished_at, success, error,
-                 summary, session_key, delivery_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                execution.id,
-                execution.job_id,
-                execution.started_at.isoformat(),
-                self._iso(execution.finished_at),
-                1 if execution.success else 0,
-                execution.error,
-                execution.summary,
-                execution.session_key,
-                execution.delivery_status,
-            ),
-        )
-        await self._db().commit()
+        async with self._write_lock:
+            await self._db().execute(
+                """
+                INSERT INTO scheduler_runs
+                    (id, job_id, started_at, finished_at, success, error,
+                     summary, session_key, delivery_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    execution.id,
+                    execution.job_id,
+                    execution.started_at.isoformat(),
+                    self._iso(execution.finished_at),
+                    1 if execution.success else 0,
+                    execution.error,
+                    execution.summary,
+                    execution.session_key,
+                    execution.delivery_status,
+                ),
+            )
+            if not self._in_transaction:
+                await self._db().commit()
 
     async def list_executions(self, job_id: str, limit: int = 20) -> list[JobExecution]:
         async with self._db().execute(
@@ -886,38 +947,40 @@ class JobStore:
 
     async def prune_runs(self, max_age_days: int = 30, max_per_job: int = 100) -> int:
         """Delete old execution records. Returns total rows deleted."""
-        from datetime import UTC, timedelta
+        async with self._write_lock:
+            from datetime import timedelta
 
-        cutoff = (datetime.now(UTC) - timedelta(days=max_age_days)).isoformat()
+            cutoff = (datetime.now(UTC) - timedelta(days=max_age_days)).isoformat()
 
-        # Delete by age
-        cur = await self._db().execute(
-            "DELETE FROM scheduler_runs WHERE started_at < ?",
-            (cutoff,),
-        )
-        deleted = cur.rowcount
-
-        # Delete excess per job (keep newest max_per_job)
-        async with self._db().execute("SELECT DISTINCT job_id FROM scheduler_runs") as cur2:
-            job_ids = [r[0] for r in await cur2.fetchall()]
-
-        for job_id in job_ids:
-            cur3 = await self._db().execute(
-                """
-                DELETE FROM scheduler_runs
-                WHERE job_id = ? AND id NOT IN (
-                    SELECT id FROM scheduler_runs
-                    WHERE job_id = ?
-                    ORDER BY started_at DESC
-                    LIMIT ?
-                )
-                """,
-                (job_id, job_id, max_per_job),
+            # Delete by age
+            cur = await self._db().execute(
+                "DELETE FROM scheduler_runs WHERE started_at < ?",
+                (cutoff,),
             )
-            deleted += cur3.rowcount
+            deleted = cur.rowcount
 
-        await self._db().commit()
-        return deleted
+            # Delete excess per job (keep newest max_per_job)
+            async with self._db().execute("SELECT DISTINCT job_id FROM scheduler_runs") as cur2:
+                job_ids = [r[0] for r in await cur2.fetchall()]
+
+            for job_id in job_ids:
+                cur3 = await self._db().execute(
+                    """
+                    DELETE FROM scheduler_runs
+                    WHERE job_id = ? AND id NOT IN (
+                        SELECT id FROM scheduler_runs
+                        WHERE job_id = ?
+                        ORDER BY started_at DESC
+                        LIMIT ?
+                    )
+                    """,
+                    (job_id, job_id, max_per_job),
+                )
+                deleted += cur3.rowcount
+
+            if not self._in_transaction:
+                await self._db().commit()
+            return deleted
 
     async def iter_due(self, now: datetime) -> AsyncIterator[CronJob]:
         """Yield jobs whose next_run_at <= now, status pending, enabled, and not backing off."""

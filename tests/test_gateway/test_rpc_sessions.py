@@ -2006,6 +2006,60 @@ class TestSessionsDelete:
         assert res.payload["deleted"] == []
         assert len(res.payload["errors"]) == 1
 
+    @pytest.mark.asyncio
+    async def test_delete_cancels_tasks_and_evicts_runtime_state(
+        self, dispatcher, session, monkeypatch
+    ):
+        """Deleting a session must not leave process-global state behind (#750)."""
+        from agentos.engine.steps.agentos_router import _history_store
+        from agentos.gateway.subagent_announce import _tracker
+        from agentos.tools.builtin.sessions import _get_spawn_lock, _spawn_locks
+
+        key = session.session_key
+        _tracker.mark_closed(key, "task-1")
+        _history_store.set(key, [{"turn_index": 0}])
+        _get_spawn_lock(key)
+
+        cancelled: list[str] = []
+
+        class _Runtime:
+            async def cancel(self, *, session_key: str, source: str = "", reason: str = "") -> int:
+                cancelled.append(session_key)
+                return 1
+
+        ctx = make_ctx(session_manager=FakeSessionManager([session]), task_runtime=_Runtime())
+        try:
+            res = await dispatcher.dispatch("r1", "sessions.delete", {"key": key}, ctx)
+
+            assert res.ok is True
+            assert res.payload["deleted"] == [key]
+            assert cancelled == [key]
+            assert not _tracker.is_closed(key, "task-1")
+            assert _history_store.get(key) is None
+            assert key not in _spawn_locks
+        finally:
+            _tracker._closed.discard((key, "task-1"))
+            _history_store.clear()
+            _spawn_locks.pop(key, None)
+
+    @pytest.mark.asyncio
+    async def test_delete_survives_a_task_runtime_that_cannot_cancel(self, dispatcher, session):
+        """A failing cancel must not turn "Delete Chat" into an error (#750)."""
+
+        class _BrokenRuntime:
+            async def cancel(self, **_kwargs) -> int:
+                raise RuntimeError("runtime is down")
+
+        ctx = make_ctx(session_manager=FakeSessionManager([session]), task_runtime=_BrokenRuntime())
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.delete", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is True
+        assert res.payload["deleted"] == [session.session_key]
+        assert res.payload["errors"] == []
+
 
 class TestSessionsCompact:
     @pytest.mark.asyncio

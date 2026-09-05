@@ -503,9 +503,11 @@ class DeliveryChain:
             log.warning("delivery.webhook_url_invalid", job_id=job_id, reason=str(exc))
             return _failed(f"invalid webhook URL: {exc}")
 
-        import httpx
-
         from agentos.channels._util import retry_request
+        from agentos.tools.ssrf_client import (
+            ssrf_guarded_client,
+            validate_metadata_only_address,
+        )
 
         headers = {"Content-Type": "application/json"}
         if token:
@@ -517,7 +519,18 @@ class DeliveryChain:
             "deliveredAt": datetime.now(UTC).isoformat(),
         }
         try:
-            async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT_SECONDS) as client:
+            # ``validate_webhook_url`` above resolved the hostname once; httpx
+            # would resolve it again when it dials, so a short-TTL rebinding
+            # domain could answer with a public address for the check and with
+            # 169.254.169.254 for the socket. The guarded client dials the
+            # address it validated, and does so on every retry attempt because
+            # ``retry_request`` re-enters ``client.post`` on the same guarded
+            # client. Metadata-only, not the full fetch policy: cron webhooks
+            # are pointed at n8n on localhost and at LAN boxes on purpose.
+            async with ssrf_guarded_client(
+                timeout=_WEBHOOK_TIMEOUT_SECONDS,
+                validator=validate_metadata_only_address,
+            ) as client:
                 # retry_request's defaults (3 retries, 1s base) keep the worst
                 # case near 7s plus jitter — inside the job's own timeout
                 # budget, whose slot is held while we back off.

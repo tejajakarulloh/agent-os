@@ -48,6 +48,7 @@ from agentos.session.compaction_lifecycle import (
 )
 from agentos.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
 from agentos.session.naming import normalize_session_name
+from agentos.session.runtime_state import evict_session_runtime_state
 from agentos.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
 _d = get_dispatcher()
@@ -207,6 +208,29 @@ async def _drain_task_runtime_for_reset(task_runtime: Any, session_key: str) -> 
     before issuing cancellation so reset does not append a false
     ``[interrupted]`` marker into the transcript being flushed.
     """
+    await _drain_task_runtime_for_session(
+        task_runtime,
+        session_key,
+        source="sessions_reset",
+        reason="session_reset",
+        op="reset",
+    )
+
+
+async def _drain_task_runtime_for_session(
+    task_runtime: Any,
+    session_key: str,
+    *,
+    source: str,
+    reason: str,
+    op: str,
+) -> None:
+    """Settle, cancel, and drain the runtime tasks of one session.
+
+    Shared by reset and delete: both need the session to stop producing work
+    before they touch its rows. ``op`` only names the log events so the two
+    callers stay distinguishable in the gateway log.
+    """
     has_runtime_listing = hasattr(task_runtime, "list") and hasattr(task_runtime, "wait")
 
     if has_runtime_listing:
@@ -223,13 +247,13 @@ async def _drain_task_runtime_for_reset(task_runtime: Any, session_key: str) -> 
                 except TimeoutError:
                     pass
         except Exception:
-            log.warning("sessions.reset.task_runtime_settle_failed", session_key=session_key)
+            log.warning(f"sessions.{op}.task_runtime_settle_failed", session_key=session_key)
 
     await _cancel_task_runtime(
         task_runtime,
         session_key=session_key,
-        source="sessions_reset",
-        reason="session_reset",
+        source=source,
+        reason=reason,
     )
 
     if not has_runtime_listing:
@@ -244,9 +268,9 @@ async def _drain_task_runtime_for_reset(task_runtime: Any, session_key: str) -> 
                     timeout=_RESET_RUNTIME_CANCEL_DRAIN_SECONDS,
                 )
     except TimeoutError:
-        log.warning("sessions.reset.task_runtime_drain_timeout", session_key=session_key)
+        log.warning(f"sessions.{op}.task_runtime_drain_timeout", session_key=session_key)
     except Exception:
-        log.warning("sessions.reset.task_runtime_drain_failed", session_key=session_key)
+        log.warning(f"sessions.{op}.task_runtime_drain_failed", session_key=session_key)
 
 
 def _optional_positive_timeout(config: Any, attr: str, default: float) -> float | None:
@@ -1946,11 +1970,34 @@ async def _handle_sessions_delete(params: dict | None, ctx: RpcContext) -> dict:
     if not keys:
         raise ValueError("params.key or params.keys is required")
 
+    task_runtime = getattr(ctx, "task_runtime", None)
+
     deleted: list[str] = []
     errors: list[str] = []
     for k in keys:
         try:
-            await storage.delete_session(k)
+            # Runtime state and the task runtime are keyed by the canonical
+            # form, the same one storage.delete_session normalizes to; evicting
+            # the raw request key would miss every entry.
+            canonical = canonicalize_session_key(k)
+            # Cancel first: an in-flight turn handler would otherwise keep
+            # writing to a session whose rows are about to disappear, and it
+            # could repopulate the runtime state evicted on the next line.
+            # Best effort — a task runtime that fails to cancel must not turn
+            # "Delete Chat" into an error and leave the session in place.
+            if task_runtime is not None:
+                try:
+                    await _drain_task_runtime_for_session(
+                        task_runtime,
+                        canonical,
+                        source="sessions_delete",
+                        reason="session_deleted",
+                        op="delete",
+                    )
+                except Exception:
+                    log.warning("sessions.delete.task_cancel_failed", session_key=canonical)
+            evict_session_runtime_state(canonical)
+            await storage.delete_session(canonical)
             deleted.append(k)
         except Exception as exc:
             errors.append(f"{k}: {exc}")

@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from agentos.mcp_server import bridge as bridge_module
 from agentos.mcp_server.bridge import AgentOSMCPBridge
 
 
@@ -261,3 +262,131 @@ async def test_events_wait_uses_dedicated_connection_and_closes_it() -> None:
     assert result["current_stream_seq"] == 8
     assert clients[0].closed is False
     assert event_client.closed is True
+
+
+class RecordingEventClient(FakeGatewayClient):
+    """Fake client that records the timeout handed to each ``recv_event`` call."""
+
+    def __init__(self, *, event: dict[str, Any] | None = None) -> None:
+        super().__init__()
+        self.recv_timeouts: list[float | None] = []
+        self._event = event or {
+            "event": "session.event.done",
+            "payload": {"session_key": "agent:main:main", "stream_seq": 1},
+        }
+
+    async def recv_event(self, timeout: float | None = None) -> dict[str, Any]:
+        self.recv_timeouts.append(timeout)
+        return dict(self._event)
+
+
+class EndlessEventClient(FakeGatewayClient):
+    """Fake client that yields non-terminal events forever."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.recv_count = 0
+
+    async def recv_event(self, timeout: float | None = None) -> dict[str, Any]:
+        self.recv_count += 1
+        return {
+            "event": "session.event.text_delta",
+            "payload": {
+                "session_key": "agent:main:main",
+                "stream_seq": self.recv_count,
+                "text": "x",
+            },
+        }
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [(10**9, bridge_module._MAX_SESSION_LIST_LIMIT), (0, 1), (-5, 1), (10, 10)],
+)
+@pytest.mark.asyncio
+async def test_conversations_list_clamps_limit(requested: int, expected: int) -> None:
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.conversations_list(limit=requested)
+
+    assert client.calls == [("sessions.list", {"limit": expected})]
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [(10**9, bridge_module._MAX_HISTORY_LIMIT), (0, 1), (-5, 1), (25, 25)],
+)
+@pytest.mark.asyncio
+async def test_messages_read_clamps_limit(requested: int, expected: int) -> None:
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.messages_read("agent:main:main", limit=requested)
+
+    assert client.calls == [("chat.history", {"sessionKey": "agent:main:main", "limit": expected})]
+
+
+@pytest.mark.asyncio
+async def test_transcript_jsonl_clamps_limit_through_messages_read() -> None:
+    client = FakeGatewayClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.transcript_jsonl("agent:main:main", limit=10**9)
+
+    assert client.calls == [
+        (
+            "chat.history",
+            {"sessionKey": "agent:main:main", "limit": bridge_module._MAX_HISTORY_LIMIT},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_events_wait_clamps_effective_deadline() -> None:
+    client = RecordingEventClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.events_wait("agent:main:main", timeout_ms=3_600_000)
+
+    assert client.recv_timeouts
+    first_timeout = client.recv_timeouts[0]
+    assert first_timeout is not None
+    # The deadline must come from the clamped timeout, not the requested hour.
+    assert first_timeout <= bridge_module._MAX_EVENTS_WAIT_TIMEOUT_MS / 1000
+
+
+@pytest.mark.asyncio
+async def test_events_wait_preserves_timeout_below_the_cap() -> None:
+    client = RecordingEventClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    await bridge.events_wait("agent:main:main", timeout_ms=2_000)
+
+    first_timeout = client.recv_timeouts[0]
+    assert first_timeout is not None
+    assert 1.0 < first_timeout <= 2.0
+
+
+@pytest.mark.asyncio
+async def test_events_wait_clamps_max_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bridge_module, "_MAX_EVENTS_WAIT_EVENTS", 3)
+    client = EndlessEventClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    # Keep the deadline short: if the clamp regresses, the loop honours 10**9
+    # against an endless client, and the test should fail fast rather than
+    # allocate events until the runner dies.
+    result = await bridge.events_wait("agent:main:main", timeout_ms=200, max_events=10**9)
+
+    assert len(result["events"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_events_wait_preserves_max_events_below_the_cap() -> None:
+    client = EndlessEventClient()
+    bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
+
+    result = await bridge.events_wait("agent:main:main", timeout_ms=200, max_events=2)
+
+    assert len(result["events"]) == 2

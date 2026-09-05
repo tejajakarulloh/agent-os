@@ -251,3 +251,19 @@ def decide_recovery_action(kind: ProviderFailureKind) -> ProviderRecoveryAction:
     if kind is ProviderFailureKind.AUTH_INVALID:
         return ProviderRecoveryAction.FAIL_CONFIG
     return ProviderRecoveryAction.SURFACE
+
+
+def is_transport_timeout(raw_code: str = "", message: str = "") -> bool:
+    """Return True when the error is specifically a request timeout.
+
+    Transport-transient covers both brief blips (connection reset, DNS hiccup)
+    and hard timeouts (upstream hangs for the full read-timeout window).
+    Timeouts are far less likely to resolve on a simple same-model retry —
+    the upstream is usually genuinely unreachable — so callers can use this
+    to cap retries more aggressively.
+    """
+    code = (raw_code or "").strip().lower()
+    msg = (message or "").strip().lower()
+    if code == "timeout":
+        return True
+    return "timed out" in msg or "request timed out" in msg

@@ -204,7 +204,7 @@ there is nothing to hide and a visible, diffable setting is easier to share and
 review:
 
 ```sh
-agentos config set skills.config.wiki.path /srv/wiki
+agentos config set skills.config.wiki.path /srv/wiki --config ~/.agentos/config.toml
 ```
 
 When the agent opens the skill, the values currently in effect are appended to
@@ -901,6 +901,7 @@ session_limit = 5.0     # hard stop once one session reaches this
 session_warn = 4.0      # one-shot warning for that session
 daily_limit = 50.0      # hard stop for gateway-wide spend on the current UTC day
 daily_warn = 40.0       # one-shot warning for that day
+turn_reservation = 0.25 # headroom held for each in-flight turn (0 disables)
 
 [budgets.agent_daily_limit]
 main = 20.0
@@ -935,6 +936,17 @@ their `*_limit` counterparts.
 - Subagent turns run through the same gate, and their spend is attributed to
   the parent agent id, so a fan-out is bounded by the agent and daily
   ceilings rather than multiplying past them.
+- Admission *reserves* as well as checks. Spend is only recorded as a turn
+  burns tokens, so children dispatched at the same moment would otherwise all
+  read the same pre-fan-out total and all clear the same ceiling. Each admitted
+  turn holds `turn_reservation` dollars (default `0.25`) against every scope
+  its session bills to, and the hold is released the moment the turn ends —
+  including on error, cancellation, and an abandoned turn. It therefore bites
+  only within that much of a limit, and only on turns that overlap: a ceiling
+  is never shrunk for turns that run one after another. Set
+  `turn_reservation = 0` to reserve nothing. The re-check *inside* a turn
+  weighs recorded spend only, so a turn is never stopped by its own
+  reservation.
 - Changing a ceiling requires a gateway restart to take effect. `budgets.*` is
   not on the live-reload allowlist, so both `agentos config` and the Web UI
   report `restart_required` when you change one. Restart before relying on a

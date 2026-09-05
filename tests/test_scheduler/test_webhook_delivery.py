@@ -7,13 +7,21 @@ validated up front and rejected at add time when malformed.
 
 from __future__ import annotations
 
+import ipaddress
+import socket
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
-from agentos.scheduler.delivery import DeliveryChain, validate_webhook_url
+from agentos.scheduler.delivery import (
+    _WEBHOOK_TIMEOUT_SECONDS,
+    DeliveryChain,
+    status_detail,
+    validate_webhook_url,
+)
 from agentos.scheduler.ops import SchedulerOps
 from agentos.scheduler.payloads import make_agent_turn_payload
 from agentos.scheduler.persistence import JobStore
@@ -24,6 +32,7 @@ from agentos.scheduler.types import (
     ScheduleKind,
     SessionTarget,
 )
+from agentos.tools import ssrf_client
 
 # --- URL validation --------------------------------------------------------
 
@@ -256,10 +265,7 @@ class _RecordingAsyncClient:
 async def test_deliver_webhook_posts_json_with_bearer(monkeypatch) -> None:
     _RecordingAsyncClient.instances.clear()
 
-    class _FakeHttpx:
-        AsyncClient = _RecordingAsyncClient
-
-    monkeypatch.setitem(__import__("sys").modules, "httpx", _FakeHttpx)
+    monkeypatch.setattr(httpx, "AsyncClient", _RecordingAsyncClient)
 
     chain = DeliveryChain()
     status = await chain._deliver_webhook(
@@ -281,10 +287,7 @@ async def test_deliver_webhook_posts_json_with_bearer(monkeypatch) -> None:
 async def test_deliver_webhook_omits_authorization_when_no_token(monkeypatch) -> None:
     _RecordingAsyncClient.instances.clear()
 
-    class _FakeHttpx:
-        AsyncClient = _RecordingAsyncClient
-
-    monkeypatch.setitem(__import__("sys").modules, "httpx", _FakeHttpx)
+    monkeypatch.setattr(httpx, "AsyncClient", _RecordingAsyncClient)
 
     chain = DeliveryChain()
     status = await chain._deliver_webhook(
@@ -309,10 +312,7 @@ async def test_deliver_webhook_returns_failed_on_http_error(monkeypatch, no_back
 
             return _Resp()
 
-    class _FakeHttpx:
-        AsyncClient = _ErrorClient
-
-    monkeypatch.setitem(__import__("sys").modules, "httpx", _FakeHttpx)
+    monkeypatch.setattr(httpx, "AsyncClient", _ErrorClient)
     _RecordingAsyncClient.instances.clear()
 
     chain = DeliveryChain()
@@ -346,10 +346,7 @@ def _scripted_httpx(monkeypatch, responses):
                 raise item
             return item
 
-    class _FakeHttpx:
-        AsyncClient = _ScriptedClient
-
-    monkeypatch.setitem(__import__("sys").modules, "httpx", _FakeHttpx)
+    monkeypatch.setattr(httpx, "AsyncClient", _ScriptedClient)
     _RecordingAsyncClient.instances.clear()
 
 
@@ -417,3 +414,149 @@ async def test_deliver_webhook_honours_retry_after_on_429(monkeypatch, no_backof
 
     assert status == "delivered"
     no_backoff.assert_awaited_once_with(2.0)
+
+
+# --- connect-time SSRF guard (issue #725) ----------------------------------
+#
+# ``validate_webhook_url`` resolves the hostname once and checks the answer;
+# httpx then resolves it again when it opens the socket. A short-TTL rebinding
+# domain can answer with a public address for the check and with
+# ``169.254.169.254`` for the connect, so the job payload lands on the cloud
+# metadata endpoint. The guarded client dials the address that was validated.
+
+METADATA_IP = "169.254.169.254"
+
+
+def _sequence_resolver(*ips: str):
+    """``getaddrinfo`` double that answers with a different address per call.
+
+    IP literals resolve to themselves so the wrapped backend can still dial the
+    literal the guard approved.
+    """
+    calls: list[str] = []
+
+    def resolver(host, port=None, *args, **kwargs):
+        calls.append(host)
+        try:
+            ipaddress.ip_address(str(host).strip("[]"))
+        except ValueError:
+            index = min(len([c for c in calls if c == host]) - 1, len(ips) - 1)
+            answer = ips[index]
+        else:
+            answer = str(host)
+        family = socket.AF_INET6 if ipaddress.ip_address(answer).version == 6 else socket.AF_INET
+        return [(family, socket.SOCK_STREAM, 6, "", (answer, port or 80))]
+
+    resolver.calls = calls  # type: ignore[attr-defined]
+    return resolver
+
+
+class _LocalWebhookServer:
+    """Minimal HTTP/1.1 responder on an ephemeral loopback port.
+
+    Answers every connection it is given rather than just the first, so a
+    regression that reintroduces retries fails on the assertion instead of
+    hanging on an unanswered socket, and takes a timeout on the accept loop so
+    the thread cannot outlive the test on any platform.
+    """
+
+    def __init__(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self._sock.settimeout(0.5)
+        self.port = self._sock.getsockname()[1]
+        self.requests: list[bytes] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:  # pragma: no cover - the socket closed under us
+                return
+            with conn:
+                conn.settimeout(5.0)
+                try:
+                    self.requests.append(conn.recv(65536))
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                        b"Content-Length: 2\r\nConnection: close\r\n\r\nok"
+                    )
+                    conn.shutdown(socket.SHUT_WR)
+                except OSError:  # pragma: no cover - client went away
+                    pass
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+        self._sock.close()
+
+
+async def test_deliver_webhook_uses_the_metadata_only_connect_guard(monkeypatch) -> None:
+    """The POST goes through ``ssrf_guarded_client``, not a bare client."""
+    recorded: dict[str, object] = {}
+
+    def _fake_guarded_client(*, validator, **kwargs):
+        recorded["validator"] = validator
+        recorded["kwargs"] = kwargs
+        return _RecordingAsyncClient(**kwargs)
+
+    monkeypatch.setattr(ssrf_client, "ssrf_guarded_client", _fake_guarded_client)
+    _RecordingAsyncClient.instances.clear()
+
+    chain = DeliveryChain()
+    status = await chain._deliver_webhook(
+        _webhook_job("https://hooks.example/cron"),
+        text="x",
+    )
+
+    assert status == "delivered"
+    # Metadata-only, not the full fetch policy: cron webhooks are pointed at
+    # n8n on localhost and LAN boxes on purpose, and must keep working.
+    assert recorded["validator"] is ssrf_client.validate_metadata_only_address
+    assert recorded["kwargs"]["timeout"] == _WEBHOOK_TIMEOUT_SECONDS
+
+
+async def test_deliver_webhook_blocks_dns_rebinding_to_metadata(monkeypatch, no_backoff) -> None:
+    """A name that rebinds to IMDS after URL validation never gets the payload."""
+    resolver = _sequence_resolver("127.0.0.1", METADATA_IP)
+    monkeypatch.setattr(socket, "getaddrinfo", resolver)
+
+    chain = DeliveryChain()
+    status = await chain._deliver_webhook(
+        _webhook_job("http://rebind.example/hook"),
+        text="secret summary",
+    )
+
+    assert status == "delivery_failed"
+    assert "metadata" in status_detail(status).lower()
+    # The block has to come from the connect guard, not from validate_webhook_url:
+    # SSRFBlockedError is a ValueError, so a check-time block would also mention
+    # metadata — but it would carry the "invalid webhook URL" prefix, and it would
+    # leave the second resolution unmade.
+    assert not status_detail(status).startswith("invalid webhook URL")
+    assert resolver.calls == ["rebind.example", "rebind.example"]
+    # Blocked at connect time, so retry_request never got a transient error to
+    # sleep on — a rebinding target must not be retried into.
+    no_backoff.assert_not_awaited()
+
+
+async def test_deliver_webhook_still_reaches_a_loopback_hook(no_backoff) -> None:
+    """The metadata floor keeps localhost hooks (n8n and friends) working."""
+    server = _LocalWebhookServer()
+    try:
+        chain = DeliveryChain()
+        status = await chain._deliver_webhook(
+            _webhook_job(f"http://127.0.0.1:{server.port}/hook"),
+            text="summary text",
+        )
+    finally:
+        server.close()
+
+    assert status == "delivered"
+    assert server.requests and b"POST /hook" in server.requests[0]

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Any
+from functools import wraps
+from typing import Any, Concatenate
 
 from agentos.compat import aiosqlite
 from agentos.session.keys import canonicalize_session_key, normalize_agent_id
@@ -21,6 +24,26 @@ from agentos.session.models import (
 )
 
 log = logging.getLogger(__name__)
+
+
+def _serialized_write[**P, R](
+    method: Callable[Concatenate[SessionStorage, P], Awaitable[R]],
+) -> Callable[Concatenate[SessionStorage, P], Awaitable[R]]:
+    """Hold transaction ownership for a complete mutating storage call."""
+
+    @wraps(method)
+    async def wrapped(
+        self: SessionStorage, /, *args: P.args, **kwargs: P.kwargs
+    ) -> R:
+        async with self._write_lock:
+            try:
+                return await method(self, *args, **kwargs)
+            except BaseException:
+                if self.conn.in_transaction:
+                    await self.conn.rollback()
+                raise
+
+    return wrapped
 
 
 class StaleEpochError(Exception):
@@ -416,6 +439,7 @@ class SessionStorage:
     ) -> None:
         self._db_path = db_path
         self._conn: Any | None = None
+        self._write_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self._conn = await aiosqlite.connect(self._db_path)
@@ -634,6 +658,7 @@ class SessionStorage:
 
     # ── Session CRUD ────────────────────────────────────────────────────────
 
+    @_serialized_write
     async def upsert_session(self, node: SessionNode) -> None:
         node.session_key = canonicalize_session_key(node.session_key)
         node.agent_id = normalize_agent_id(node.agent_id)
@@ -698,6 +723,7 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [SessionNode(**_deserialize_row(dict(r))) for r in rows]
 
+    @_serialized_write
     async def delete_session(self, session_key: str) -> None:
         session_key = canonicalize_session_key(session_key)
         session = await self.get_session(session_key)
@@ -739,14 +765,27 @@ class SessionStorage:
             await self.conn.rollback()
             raise
 
-    async def prune_stale_sessions(self, before_ms: int) -> int:
-        """Delete sessions not updated since before_ms epoch ms. Returns count deleted."""
+    async def list_stale_session_keys(self, before_ms: int) -> list[str]:
+        """Return keys of sessions not updated since ``before_ms`` epoch ms.
+
+        Split out of :meth:`prune_stale_sessions` so callers that need to drop
+        per-session state outside storage (in-memory runtime bookkeeping, live
+        tasks) can see the keys before the rows are gone.
+        """
         async with self.conn.execute(
             "SELECT session_key FROM sessions WHERE updated_at < ?",
             (before_ms,),
         ) as cur:
             rows = await cur.fetchall()
-        session_keys = [row[0] for row in rows]
+        return [row[0] for row in rows]
+
+    async def prune_stale_sessions(self, before_ms: int) -> int:
+        """Delete sessions not updated since before_ms epoch ms. Returns count deleted.
+
+        Storage-only: it does not evict the process-global runtime state keyed
+        by session. Prefer ``SessionManager.prune_stale``, which does.
+        """
+        session_keys = await self.list_stale_session_keys(before_ms)
         for session_key in session_keys:
             await self.delete_session(session_key)
         return len(session_keys)
@@ -756,6 +795,7 @@ class SessionStorage:
             row = await cur.fetchone()
         return row[0] if row else 0
 
+    @_serialized_write
     async def increment_epoch(self, session_key: str) -> int:
         """Atomically increment the epoch counter for a session.
 
@@ -786,6 +826,7 @@ class SessionStorage:
 
     # ── Project CRUD ────────────────────────────────────────────────────────
 
+    @_serialized_write
     async def upsert_project(self, project: ProjectNode) -> None:
         project.agent_id = normalize_agent_id(project.agent_id)
         data = project.model_dump()
@@ -800,6 +841,7 @@ class SessionStorage:
         await self.conn.execute(sql, values)
         await self.conn.commit()
 
+    @_serialized_write
     async def update_project_fields(
         self,
         project_id: str,
@@ -857,6 +899,7 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [ProjectNode(**dict(r)) for r in rows]
 
+    @_serialized_write
     async def delete_project(self, project_id: str) -> int:
         """Delete a project, detaching its sessions (they survive project-less).
 
@@ -902,6 +945,7 @@ class SessionStorage:
 
     # ── AgentTask ledger CRUD ───────────────────────────────────────────────
 
+    @_serialized_write
     async def create_agent_task(self, task: AgentTaskRecord) -> AgentTaskRecord:
         task.session_key = canonicalize_session_key(task.session_key)
         task.agent_id = normalize_agent_id(task.agent_id)
@@ -924,6 +968,7 @@ class SessionStorage:
             return None
         return AgentTaskRecord(**_deserialize_row(dict(row)))
 
+    @_serialized_write
     async def update_agent_task(self, task_id: str, **fields: Any) -> AgentTaskRecord:
         if not fields:
             existing = await self.get_agent_task(task_id)
@@ -974,6 +1019,7 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [AgentTaskRecord(**_deserialize_row(dict(row))) for row in rows]
 
+    @_serialized_write
     async def upsert_memory_durable_receipt(
         self,
         receipt: MemoryDurableReceipt,
@@ -1057,6 +1103,7 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [MemoryDurableReceipt(**_deserialize_row(dict(row))) for row in rows]
 
+    @_serialized_write
     async def update_memory_durable_receipt(
         self,
         receipt_id: str,
@@ -1115,6 +1162,7 @@ class SessionStorage:
                     bucket.append(task)
         return grouped
 
+    @_serialized_write
     async def mark_abandoned_agent_tasks(self, now_ms: int | None = None) -> int:
         """Mark non-terminal persisted tasks as abandoned after process restart."""
         ts = now_ms or _now_ms()
@@ -1141,6 +1189,7 @@ class SessionStorage:
 
     # ── Transcript CRUD ──────────────────────────────────────────────────────
 
+    @_serialized_write
     async def append_transcript_entry(
         self, entry: TranscriptEntry, *, expected_epoch: int | None = None
     ) -> None:
@@ -1263,6 +1312,7 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [TranscriptEntry(**_deserialize_row(dict(r))) for r in rows]
 
+    @_serialized_write
     async def copy_compacted_transcript_entries(
         self,
         *,
@@ -1366,6 +1416,7 @@ class SessionStorage:
             result.setdefault(sid, 0)
         return result
 
+    @_serialized_write
     async def delete_transcript(self, session_id: str) -> None:
         await self.conn.execute(
             "DELETE FROM transcript_entries WHERE session_id = ?", (session_id,)
@@ -1376,6 +1427,7 @@ class SessionStorage:
         )
         await self.conn.commit()
 
+    @_serialized_write
     async def delete_transcript_entry(self, session_id: str, message_id: str) -> bool:
         """Delete a single transcript entry by ``message_id``.
 
@@ -1392,6 +1444,7 @@ class SessionStorage:
         await self.conn.commit()
         return removed > 0
 
+    @_serialized_write
     async def delete_summaries(self, session_id: str) -> None:
         await self.conn.execute("DELETE FROM session_summaries WHERE session_id = ?", (session_id,))
         await self.conn.commit()
@@ -1408,6 +1461,7 @@ class SessionStorage:
 
     # ── SessionSummary CRUD ──────────────────────────────────────────────────
 
+    @_serialized_write
     async def save_summary(self, summary: SessionSummary) -> SessionSummary:
         """Persist a compaction summary. Sets compaction_index automatically."""
         _next_idx_sql = (
@@ -1463,6 +1517,7 @@ class SessionStorage:
                 values,
             )
 
+    @_serialized_write
     async def rewrite_compacted_session(
         self,
         *,
@@ -1638,6 +1693,7 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [TranscriptEntry(**_deserialize_row(dict(r))) for r in rows]
 
+    @_serialized_write
     async def update_summary_flush_receipt_status(
         self,
         summary_id: int,
@@ -1649,6 +1705,7 @@ class SessionStorage:
         )
         await self.conn.commit()
 
+    @_serialized_write
     async def update_summary_flush_receipt_status_by_compaction(
         self,
         *,
@@ -1669,6 +1726,7 @@ class SessionStorage:
 
     # ── SessionContextState CRUD ─────────────────────────────────────────────
 
+    @_serialized_write
     async def save_context_state(
         self, state: SessionContextState
     ) -> SessionContextState:
@@ -1715,6 +1773,7 @@ class SessionStorage:
             rows = await cur.fetchall()
         return [SessionContextState(**_deserialize_row(dict(row))) for row in rows]
 
+    @_serialized_write
     async def invalidate_context_states(
         self,
         session_key: str,
@@ -1753,7 +1812,7 @@ class SessionStorage:
         import re as _re
 
         # Whitelist: only allow alphanumeric and whitespace through
-        cleaned = _re.sub(r"[^a-zA-Z0-9\s]", " ", raw)
+        cleaned = _re.sub(r"[^\w\s]", " ", raw)
         # Collapse whitespace and split into tokens
         tokens = cleaned.split()
         if not tokens:

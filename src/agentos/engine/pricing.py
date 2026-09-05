@@ -609,6 +609,8 @@ _LEGACY_PRICING_PREFIXES: list[tuple[str, PriceEntry]] = [
     ("minimax-m2.7", PriceEntry(0.118, 0.99)),
     ("gemini-2.5-flash-lite", PriceEntry(0.10, 0.40)),
     ("gemini-2.5-flash", PriceEntry(0.15, 0.60)),
+    ("gemini-2.0-flash", PriceEntry(0.10, 0.40, 0.025)),
+    ("gemini-1.5-pro", PriceEntry(1.25, 5.0, 0.3125)),
     ("qwen3.6-plus", PriceEntry(0.115, 0.688)),
     ("qwen3-max", PriceEntry(0.359, 1.434)),
     ("doubao-seed-1-6-flash", PriceEntry(0.15, 0.60)),
@@ -618,6 +620,8 @@ _LEGACY_PRICING_PREFIXES: list[tuple[str, PriceEntry]] = [
     ("deepseek/deepseek-r1", PriceEntry(0.70, 2.50)),
     ("deepseek/deepseek-v3", PriceEntry(0.26, 0.38)),
     ("deepseek/deepseek-chat", PriceEntry(0.14, 0.28)),
+    ("deepseek-reasoner", PriceEntry(0.70, 2.50, 0.14)),
+    ("deepseek-chat", PriceEntry(0.14, 0.28, 0.014)),
     # OpenAI (OpenRouter prices).
     ("openai/gpt-4.1-mini", PriceEntry(0.40, 1.60)),
     ("openai/gpt-4.1", PriceEntry(2.0, 8.0)),
@@ -640,6 +644,7 @@ _LEGACY_PRICING_PREFIXES: list[tuple[str, PriceEntry]] = [
     ("anthropic/claude-opus-4.5", PriceEntry(5.0, 25.0)),
     ("anthropic/claude-opus-4", PriceEntry(15.0, 75.0)),
     ("anthropic/claude-sonnet-4", PriceEntry(3.0, 15.0)),
+    ("anthropic/claude-3-7-sonnet", PriceEntry(3.0, 15.0, 0.30)),
     ("anthropic/claude-3-5-sonnet", PriceEntry(3.0, 15.0)),
     ("anthropic/claude-3-5-haiku", PriceEntry(0.80, 4.0)),
     ("anthropic/claude-3-opus", PriceEntry(15.0, 75.0)),
@@ -647,6 +652,7 @@ _LEGACY_PRICING_PREFIXES: list[tuple[str, PriceEntry]] = [
     ("anthropic/claude-3-haiku", PriceEntry(0.25, 1.25)),
     ("claude-opus-4", PriceEntry(15.0, 75.0)),
     ("claude-sonnet-4", PriceEntry(3.0, 15.0)),
+    ("claude-3-7-sonnet", PriceEntry(3.0, 15.0, 0.30)),
     ("claude-3-5-sonnet", PriceEntry(3.0, 15.0)),
     ("claude-3-5-haiku", PriceEntry(0.80, 4.0)),
     ("claude-3-opus", PriceEntry(15.0, 75.0)),
@@ -656,6 +662,7 @@ _LEGACY_PRICING_PREFIXES: list[tuple[str, PriceEntry]] = [
     ("google/gemini-2.5-flash", PriceEntry(0.15, 0.60)),
     ("google/gemini-2.5-pro", PriceEntry(1.25, 10.0)),
     ("google/gemini-2.0-flash", PriceEntry(0.10, 0.40)),
+    ("google/gemini-1.5-pro", PriceEntry(1.25, 5.0, 0.3125)),
     # Alibaba Cloud Model Studio / DashScope, Chinese Mainland (Beijing).
     # OpenAI-compatible Chat Completions returns token usage, not billed cost.
     # These prices are used only for AgentOS estimates and must not be
@@ -682,6 +689,8 @@ _PRICING_TABLE: list[tuple[str, PriceEntry]] = [
 
 _DEFAULT_PRICING = PriceEntry(3.0, 15.0)
 
+_VENDOR_PREFIXES = ("anthropic/", "google/", "deepseek/", "openai/")
+
 
 def _lookup_static_price(model_id: str) -> PriceEntry:
     override = _lookup_price_override(model_id)
@@ -691,6 +700,13 @@ def _lookup_static_price(model_id: str) -> PriceEntry:
     for prefix, entry in _PRICING_TABLE:
         if model_lower.startswith(prefix):
             return entry
+    for vendor_prefix in _VENDOR_PREFIXES:
+        if model_lower.startswith(vendor_prefix):
+            bare = model_lower[len(vendor_prefix) :]
+            for prefix, entry in _PRICING_TABLE:
+                if bare.startswith(prefix):
+                    return entry
+            break
     return _DEFAULT_PRICING
 
 
@@ -721,6 +737,7 @@ def lookup_price(model_id: str, provider_id: str = "") -> PriceEntry:
     """
     model_id = str(model_id or "").strip()
     normalized_provider = str(provider_id or "").strip().lower()
+
     gateway = _GATEWAY_PRICE_CACHES.get(normalized_provider)
     if gateway is not None:
         # The gateway's public catalog is canonical for this provider. Shared
@@ -736,6 +753,7 @@ def lookup_price(model_id: str, provider_id: str = "") -> PriceEntry:
     override = _lookup_price_override(model_id)
     if override is not None:
         return override
+
     if not _should_fetch_live_price(model_id):
         return _lookup_static_price(model_id)
 

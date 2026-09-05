@@ -195,9 +195,9 @@ async def _count_active_children(mgr: object, parent_session_key: str) -> int:
 # Per-parent-session locks serialize the check-then-create critical
 # section so two concurrent ``sessions_spawn`` calls cannot both read
 # active < max_children, both pass the gate, and both create children.
-# Entries are evicted by ``SessionManager.finish`` via
-# :func:`evict_spawn_lock` so a long-running gateway does not leak one
-# Lock per parent session that ever spawned.
+# Entries are evicted via :func:`evict_spawn_lock` on every session
+# removal path (finish, delete, prune, cap) so a long-running gateway
+# does not leak one Lock per parent session that ever spawned.
 _spawn_locks: dict[str, asyncio.Lock] = {}
 
 
@@ -212,7 +212,8 @@ def _get_spawn_lock(parent_session_key: str) -> asyncio.Lock:
 def evict_spawn_lock(parent_session_key: str) -> bool:
     """Drop the per-parent spawn lock for ``parent_session_key``.
 
-    Called from ``SessionManager.finish`` when a session goes terminal.
+    Called from ``agentos.session.runtime_state`` whenever a session goes
+    terminal or is removed.
     Safe under contention: any in-flight ``async with`` already holds a
     strong reference to the Lock object; this only removes the dict
     entry, so future spawns for a (now terminal) parent get a fresh

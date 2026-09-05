@@ -445,3 +445,221 @@ async def test_a_broken_guard_does_not_stop_the_turn() -> None:
     events = [event async for event in agent.run_turn("go")]
 
     assert not any(getattr(event, "code", "") == "budget_exceeded" for event in events)
+
+
+# ── Concurrent admission ────────────────────────────────────────────────
+
+
+PARENT = "agent:trader:telegram:acct:peer"
+
+
+def _child_key(index: int) -> str:
+    return f"agent:trader:subagent:child-{index}"
+
+
+def test_a_concurrent_sibling_cannot_clear_the_same_ceiling() -> None:
+    """Two turns admitted back to back see the same ledger, not the same gap.
+
+    This is the fan-out race: spend is recorded only as a turn burns tokens,
+    so without a reservation the second admission reads a snapshot that
+    predates the first.
+    """
+    tracker = UsageTracker()
+    _spend(tracker, SESSION, 9.9)
+    config = BudgetsConfig(session_limit=10.0, turn_reservation=0.25)
+
+    first_stop, _, first_id = tracker.reserve_turn_budget(SESSION, config)
+    assert first_stop is False
+    assert first_id is not None
+
+    second_stop, message, second_id = tracker.reserve_turn_budget(SESSION, config)
+    assert second_stop is True
+    assert second_id is None
+    assert message is not None
+    assert "reserved for turns already running" in message
+    assert "$9.9000" in message
+
+
+def test_releasing_a_reservation_gives_the_headroom_back() -> None:
+    tracker = UsageTracker()
+    _spend(tracker, SESSION, 9.9)
+    config = BudgetsConfig(session_limit=10.0, turn_reservation=0.25)
+
+    _, _, first_id = tracker.reserve_turn_budget(SESSION, config)
+    assert tracker.reserve_turn_budget(SESSION, config)[0] is True
+
+    tracker.release_turn_budget(first_id)
+
+    assert tracker.held_headroom("session", SESSION) == 0.0
+    assert tracker.reserve_turn_budget(SESSION, config)[0] is False
+
+
+def test_serial_turns_are_not_shrunk_by_the_reservation() -> None:
+    """A lone turn is still admitted right up to the ceiling.
+
+    The reservation guards siblings, so it must never make a turn that runs
+    on its own stop short of the number the operator configured.
+    """
+    tracker = UsageTracker()
+    _spend(tracker, SESSION, 9.99)
+    config = BudgetsConfig(session_limit=10.0, turn_reservation=5.0)
+
+    for _ in range(3):
+        hard_stop, _, reservation_id = tracker.reserve_turn_budget(SESSION, config)
+        assert hard_stop is False
+        tracker.release_turn_budget(reservation_id)
+
+
+def test_a_reservation_binds_the_agent_daily_scope_too() -> None:
+    """Fan-out children hold distinct session keys but one agent ceiling."""
+    tracker = UsageTracker()
+    _spend(tracker, PARENT, 9.9)
+    config = BudgetsConfig(agent_daily_limit={"trader": 10.0}, turn_reservation=0.25)
+
+    first_stop, _, first_id = tracker.reserve_turn_budget(_child_key(1), config)
+    assert first_stop is False
+    assert first_id is not None
+    assert tracker.held_headroom("agent", "trader") == pytest.approx(0.25)
+
+    sibling_stop, message, _ = tracker.reserve_turn_budget(_child_key(2), config)
+    assert sibling_stop is True
+    assert message is not None
+    assert "agent 'trader'" in message
+
+
+def test_release_frees_only_its_own_reservation() -> None:
+    tracker = UsageTracker()
+    config = BudgetsConfig(session_limit=100.0, turn_reservation=0.25)
+
+    _, _, first_id = tracker.reserve_turn_budget(SESSION, config)
+    _, _, second_id = tracker.reserve_turn_budget(SESSION, config)
+    assert first_id != second_id
+
+    tracker.release_turn_budget(first_id)
+    assert tracker.held_headroom("session", SESSION) == pytest.approx(0.25)
+
+    # A repeat release of an already-freed id must not double-refund.
+    tracker.release_turn_budget(first_id)
+    tracker.release_turn_budget(None)
+    tracker.release_turn_budget("never-issued")
+    assert tracker.held_headroom("session", SESSION) == pytest.approx(0.25)
+
+    tracker.release_turn_budget(second_id)
+    assert tracker.held_headroom("session", SESSION) == 0.0
+
+
+def test_nothing_is_reserved_when_no_ceiling_is_configured() -> None:
+    tracker = UsageTracker()
+    _spend(tracker, SESSION, 100.0)
+
+    for config in (None, BudgetsConfig(), BudgetsConfig(enabled=False, session_limit=1.0)):
+        assert tracker.reserve_turn_budget(SESSION, config) == (False, None, None)
+    assert tracker.held_headroom("session", SESSION) == 0.0
+
+
+def test_a_zero_reservation_restores_the_unreserved_gate() -> None:
+    """The knob is an opt-out, not a hard-coded behaviour change."""
+    tracker = UsageTracker()
+    _spend(tracker, SESSION, 9.9)
+    config = BudgetsConfig(session_limit=10.0, turn_reservation=0.0)
+
+    assert tracker.reserve_turn_budget(SESSION, config)[2] is None
+    assert tracker.reserve_turn_budget(SESSION, config)[0] is False
+
+
+def test_the_intra_turn_recheck_ignores_reservations() -> None:
+    """A turn must not be stopped mid-flight by the headroom it itself holds."""
+    tracker = UsageTracker()
+    _spend(tracker, SESSION, 9.9)
+    config = BudgetsConfig(session_limit=10.0, turn_reservation=0.25)
+
+    tracker.reserve_turn_budget(SESSION, config)
+
+    assert tracker.check_budget_limits(SESSION, config) == (False, None)
+
+
+def test_a_reservation_still_warns_on_recorded_spend() -> None:
+    """Warn text names a number the operator can look up in the ledger."""
+    tracker = UsageTracker()
+    _spend(tracker, SESSION, 4.0)
+    config = BudgetsConfig(session_warn=4.0, session_limit=10.0, turn_reservation=0.25)
+
+    hard_stop, message, reservation_id = tracker.reserve_turn_budget(SESSION, config)
+    assert hard_stop is False
+    assert reservation_id is not None
+    assert message == "Session cost $4.0000 has reached the $4.0000 budget warning threshold."
+
+
+def test_negative_turn_reservation_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        BudgetsConfig(turn_reservation=-1.0)
+
+
+@pytest.mark.asyncio
+async def test_a_fan_out_cannot_all_clear_the_ceiling_at_once() -> None:
+    """The reported bug: N concurrent children, N times the documented overshoot.
+
+    Each child is started before any of them finishes — the shape
+    ``SubagentManager.spawn`` produces when it dispatches a fan-out as
+    concurrent tasks, and the shape in which every child would otherwise read
+    the same pre-fan-out spend snapshot.
+    """
+    tracker = UsageTracker()
+    _spend(tracker, PARENT, 9.9)
+    runner = _runner(
+        tracker,
+        BudgetsConfig(agent_daily_limit={"trader": 10.0}, turn_reservation=0.25),
+        None,
+    )
+
+    children = [runner._run_turn("go", _child_key(index), "trader", None, []) for index in range(5)]
+    try:
+        admitted = 0
+        for child in children:
+            first_event = await child.__anext__()
+            if isinstance(first_event, ErrorEvent) and first_event.code == "budget_exceeded":
+                continue
+            admitted += 1
+        assert admitted == 1, "only the first child should have cleared the ceiling"
+    finally:
+        for child in children:
+            await child.aclose()
+
+    # Abandoning a child's turn still hands its headroom back.
+    assert tracker.held_headroom("agent", "trader") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_failed_turn_releases_its_reservation() -> None:
+    """A child that dies without spending must not eat headroom forever."""
+    tracker = UsageTracker()
+    _spend(tracker, SESSION, 9.9)
+    runner = _runner(tracker, BudgetsConfig(session_limit=10.0, turn_reservation=0.25), None)
+
+    # The stub runner has no provider, so this turn errors out rather than
+    # completing — the error exit path still has to release.
+    first = await _collect(runner)
+    assert not any(isinstance(e, ErrorEvent) and e.code == "budget_exceeded" for e in first)
+    assert tracker.held_headroom("session", SESSION) == 0.0
+
+    second = await _collect(runner)
+    assert not any(isinstance(e, ErrorEvent) and e.code == "budget_exceeded" for e in second)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_turn_releases_its_reservation() -> None:
+    """Cancellation is the third exit path, and it must free headroom too."""
+    import asyncio
+
+    tracker = UsageTracker()
+    _spend(tracker, SESSION, 9.9)
+    runner = _runner(tracker, BudgetsConfig(session_limit=10.0, turn_reservation=0.25), None)
+
+    turn = runner._run_turn("hi", SESSION, "main", None, [])
+    await turn.__anext__()
+    assert tracker.held_headroom("session", SESSION) == pytest.approx(0.25)
+
+    with pytest.raises(asyncio.CancelledError):
+        await turn.athrow(asyncio.CancelledError())
+
+    assert tracker.held_headroom("session", SESSION) == 0.0

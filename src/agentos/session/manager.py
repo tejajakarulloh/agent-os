@@ -40,6 +40,7 @@ from agentos.session.models import (
     SessionSummary,
     TranscriptEntry,
 )
+from agentos.session.runtime_state import evict_session_runtime_state
 from agentos.session.storage import SessionStorage
 from agentos.session.tokenizer import estimate_tokens
 
@@ -430,18 +431,7 @@ class SessionManager:
             child_key = getattr(child, "session_key", None)
             if not child_key:
                 continue
-            if self._task_runtime is not None:
-                try:
-                    await self._task_runtime.cancel(
-                        session_key=child_key,
-                        source="parent_session_kill",
-                        reason="parent_session_kill",
-                    )
-                except TypeError:
-                    with contextlib.suppress(Exception):
-                        await self._task_runtime.cancel(session_key=child_key)
-                except Exception:
-                    pass
+            await self._cancel_task_runtime(child_key, reason="parent_session_kill")
             try:
                 await self.kill_session(child_key)
             except KeyError:
@@ -820,30 +810,51 @@ class SessionManager:
     def _evict_session_runtime_state(session_key: str) -> None:
         """Drop in-memory subagent and routing bookkeeping for ``session_key``.
 
-        Called from ``finish`` so terminal sessions don't leak unbounded
-        entries in long-running gateway processes. Imports are local to
-        avoid import cycles with engine/gateway packages.
+        Called from ``finish`` and from every deletion path so neither
+        terminal nor deleted sessions leak unbounded entries in long-running
+        gateway processes. Idempotent, so the two overlapping callers are
+        safe. See :mod:`agentos.session.runtime_state`.
         """
-        try:
-            from agentos.gateway.subagent_announce import _tracker as _spawn_tracker
+        evict_session_runtime_state(session_key)
 
-            _spawn_tracker.evict(session_key)
-        except Exception:
-            pass
+    async def _cancel_task_runtime(self, session_key: str, *, reason: str) -> None:
+        """Cancel active/queued runtime tasks for ``session_key``, best effort.
+
+        Runs before a session row is removed so an in-flight turn handler does
+        not keep writing to a session that no longer exists. Task runtimes are
+        duck-typed across gateway and test composition, so a runtime without
+        the keyword-only signature falls back to the positional-free form.
+        """
+        if self._task_runtime is None:
+            return
         try:
-            from agentos.engine.steps.agentos_router import (
-                _history_store as _routing_store,
+            await self._task_runtime.cancel(
+                session_key=session_key,
+                source=reason,
+                reason=reason,
+            )
+        except TypeError:
+            with contextlib.suppress(Exception):
+                await self._task_runtime.cancel(session_key=session_key)
+        except Exception:
+            import structlog as _structlog
+
+            _structlog.get_logger(__name__).warning(
+                "session.task_cancel_failed", session_key=session_key, reason=reason
             )
 
-            _routing_store.evict(session_key)
-        except Exception:
-            pass
-        try:
-            from agentos.tools.builtin.sessions import evict_spawn_lock
+    async def delete(self, session_key: str) -> None:
+        """Remove a session: cancel its tasks, evict runtime state, then delete.
 
-            evict_spawn_lock(session_key)
-        except Exception:
-            pass
+        The single removal choke point for maintenance paths. Ordering matters:
+        cancelling first stops an in-flight turn from repopulating the very
+        runtime state being evicted, and eviction before the storage delete
+        keeps the process-global stores from outliving the row.
+        """
+        session_key = canonicalize_session_key(session_key)
+        await self._cancel_task_runtime(session_key, reason="session_delete")
+        evict_session_runtime_state(session_key)
+        await self._storage.delete_session(session_key)
 
     async def branch(
         self,
@@ -1530,9 +1541,18 @@ class SessionManager:
     # ── Maintenance ──────────────────────────────────────────────────────────
 
     async def prune_stale(self, max_age_ms: int) -> int:
-        """Delete sessions older than max_age_ms. Returns number pruned."""
+        """Delete sessions older than max_age_ms. Returns number pruned.
+
+        The keys are collected up front rather than delegating to
+        ``storage.prune_stale_sessions``: that helper deletes inside the
+        storage layer and returns only a count, leaving nothing to evict the
+        process-global runtime state against.
+        """
         cutoff = _now_ms() - max_age_ms
-        return await self._storage.prune_stale_sessions(cutoff)
+        session_keys = await self._storage.list_stale_session_keys(cutoff)
+        for session_key in session_keys:
+            await self.delete(session_key)
+        return len(session_keys)
 
     async def cap_entries(self, max_entries: int = 500) -> int:
         """Delete oldest sessions beyond max_entries. Returns number deleted."""
@@ -1543,7 +1563,7 @@ class SessionManager:
         # sorted by updated_at asc — oldest first
         to_delete = sorted(sessions, key=lambda s: s.updated_at)[: total - max_entries]
         for s in to_delete:
-            await self._storage.delete_session(s.session_key)
+            await self.delete(s.session_key)
         return len(to_delete)
 
     async def archive(self, session_key: str) -> None:
