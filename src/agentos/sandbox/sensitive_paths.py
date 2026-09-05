@@ -17,6 +17,8 @@ import re
 import shlex
 from pathlib import Path, PurePosixPath
 
+from agentos.redact import _CREDENTIAL_FILE_NAMES
+
 # Operator escape hatch — set AGENTOS_SENSITIVE_PATHS_DISABLED=1 to no-op
 # the entire sensitive-path block layer. ONLY for trusted single-operator
 # environments / E2E testing where sandbox=false + sensitive_path checks
@@ -28,26 +30,28 @@ _DISABLED = os.environ.get("AGENTOS_SENSITIVE_PATHS_DISABLED", "").lower() in (
     "on",
 )
 
+# Credential file names synchronized with agentos.redact._CREDENTIAL_FILE_NAMES.
+# Bare 'credentials' is excluded here because ~/.aws already covers ~/.aws/credentials,
+# and a loose file named 'credentials' outside ~/.aws is not necessarily host credentials.
+_HOST_CREDENTIAL_FILES: tuple[str, ...] = tuple(
+    sorted(name for name in _CREDENTIAL_FILE_NAMES if name != "credentials")
+)
 
 # Directory prefixes whose contents must not be read/written/deleted by the agent
 # in default mode. Strings starting with ``~`` expand to the current user's
 # home at check time.
-_SENSITIVE_PREFIXES: tuple[str, ...] = (
+_BASE_SENSITIVE_PREFIXES: tuple[str, ...] = (
     "~/.ssh",
     "~/.aws",
     "~/.azure",
     "~/.config/gcloud",
     "~/.docker/config",
     "~/.kube",
-    "~/.npmrc",
-    "~/.pypirc",
-    "~/.netrc",
     "~/.gnupg",
     "~/.password-store",
-    "~/.git-credentials",
-    "~/.pgpass",
-    "~/.dockercfg",
-    "~/.htpasswd",
+)
+
+_SYSTEM_SENSITIVE_PREFIXES: tuple[str, ...] = (
     "/etc",
     "/boot",
     "/sys",
@@ -59,9 +63,15 @@ _SENSITIVE_PREFIXES: tuple[str, ...] = (
     "/usr/lib/systemd",
 )
 
+_SENSITIVE_PREFIXES: tuple[str, ...] = (
+    *_BASE_SENSITIVE_PREFIXES,
+    *(f"~/{name}" for name in _HOST_CREDENTIAL_FILES),
+    *_SYSTEM_SENSITIVE_PREFIXES,
+)
+
 # Exact filename tails we never want mutated, regardless of parent directory.
 # Covers cases like moving an id_rsa out of ~/.ssh into /tmp.
-_SENSITIVE_SUFFIXES: tuple[str, ...] = (
+_BASE_SENSITIVE_SUFFIXES: tuple[str, ...] = (
     "/id_rsa",
     "/id_ed25519",
     "/id_ecdsa",
@@ -77,13 +87,11 @@ _SENSITIVE_SUFFIXES: tuple[str, ...] = (
     "/.zsh_history",
     "/.mysql_history",
     "/.psql_history",
-    "/.git-credentials",
-    "/.pgpass",
-    "/.dockercfg",
-    "/.htpasswd",
-    "/.netrc",
-    "/.npmrc",
-    "/.pypirc",
+)
+
+_SENSITIVE_SUFFIXES: tuple[str, ...] = (
+    *_BASE_SENSITIVE_SUFFIXES,
+    *(f"/{name}" for name in _HOST_CREDENTIAL_FILES),
 )
 
 _WORKSPACE_PARENT_EXCEPTION_MARKERS: tuple[str, ...] = ("/root",)

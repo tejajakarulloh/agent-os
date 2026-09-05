@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from agentos.sandbox.sensitive_paths import (
+    _SENSITIVE_PREFIXES,
+    _SENSITIVE_SUFFIXES,
     _is_root_target,
     is_sensitive_path,
     sensitive_path_in_text,
@@ -287,3 +289,16 @@ def test_active_workspace_exception_keeps_host_credential_blocks() -> None:
         assert sensitive_path_marker(target, workspace=workspace) == f"/{filename}"
         assert sensitive_target_in_command(f"rm {target}", workspace=workspace) == f"/{filename}"
         assert sensitive_path_in_text(f"cat {target}", workspace=workspace) == f"/{filename}"
+
+
+def test_sensitive_paths_synchronizes_with_redact_credential_file_names() -> None:
+    """Issue #981: Ensure sensitive_paths stays in lockstep with redact._CREDENTIAL_FILE_NAMES."""
+    from agentos.redact import _CREDENTIAL_FILE_NAMES
+
+    for name in _CREDENTIAL_FILE_NAMES:
+        if name == "credentials":
+            continue
+        assert f"~/{name}" in _SENSITIVE_PREFIXES, f"Missing prefix for {name}"
+        assert f"/{name}" in _SENSITIVE_SUFFIXES, f"Missing suffix for {name}"
+        assert is_sensitive_path(f"/tmp/{name}") == f"/{name}"
+        assert is_sensitive_path(str(Path.home() / name)) == f"~/{name}"
