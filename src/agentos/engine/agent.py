@@ -1487,7 +1487,7 @@ class Agent:
                 self.config.metadata.get("tool_result_store_skips", 0) + 1
             )
             logger.info(
-                "tool_result_store.skipped",
+                "tool_result_store.budget_rejected",
                 tool_use_id=tool_use_id,
                 tool_name=tool_name,
                 reason=str(exc),
