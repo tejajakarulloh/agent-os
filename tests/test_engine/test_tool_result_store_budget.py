@@ -64,6 +64,42 @@ def test_oversized_write_preserves_existing_records(tmp_path: Path) -> None:
         assert store.read(handle, session_id="s1").content == f"record-{index}"
 
 
+def test_oversized_write_does_not_evict_another_session(tmp_path: Path) -> None:
+    # The disk budget is global: _iter_records walks every session bucket, so a
+    # rejected write in one session used to take unrelated sessions down with it.
+    store = ToolResultStore(tmp_path)
+    others = [
+        store.write(
+            f"data-{session}",
+            tool_use_id=f"tu-{session}",
+            tool_name="x",
+            session_id=session,
+            session_key="k",
+            agent_id="a",
+            max_bytes=None,
+            disk_budget_bytes=500,
+            retention_seconds=None,
+        ).handle
+        for session in ("session-a", "session-b")
+    ]
+
+    with pytest.raises(ToolResultStoreBudgetError):
+        store.write(
+            "X" * 2000,
+            tool_use_id="tu-big",
+            tool_name="x",
+            session_id="session-a",
+            session_key="k",
+            agent_id="a",
+            max_bytes=None,
+            disk_budget_bytes=500,
+            retention_seconds=None,
+        )
+
+    assert _handles_on_disk(tmp_path) == set(others)
+    assert store.read(others[1], session_id="session-b").content == "data-session-b"
+
+
 def test_per_result_rejection_keeps_existing_records(tmp_path: Path) -> None:
     store = ToolResultStore(tmp_path)
     handle = _write(store, "keep-me", tool_use_id="tu-0", disk_budget_bytes=500)
