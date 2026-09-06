@@ -199,3 +199,25 @@ def test_parse_iso_at_rejects_empty() -> None:
 def test_parse_iso_at_rejects_non_string() -> None:
     with pytest.raises(CronParseError, match="Expected ISO-8601 string"):
         parse_iso_at(12345)  # type: ignore[arg-type]
+
+
+# ── Issue #1063: DOW ranges ending in SUN ───────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("expr", "expected_days"),
+    [
+        ("0 0 * * SAT-SUN", {0, 6}),
+        ("0 0 * * MON-SUN", {0, 1, 2, 3, 4, 5, 6}),
+        ("0 0 * * WED-SUN", {0, 3, 4, 5, 6}),
+        ("0 0 * * FRI-SUN", {0, 5, 6}),
+        ("0 0 * * SUN", {0}),
+        ("0 0 * * 6-7", {0, 6}),
+        ("0 0 * * 0", {0}),
+    ],
+)
+def test_dow_range_ending_in_sun_resolves_correctly(expr: str, expected_days: set[int]) -> None:
+    """Ranges ending in SUN must not raise CronParseError (issue #1063)."""
+    cron = parse_cron(expr)
+    assert cron.day_of_week.values == frozenset(expected_days)
+

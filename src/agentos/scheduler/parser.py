@@ -45,7 +45,7 @@ _MONTH_NAMES = {
 }
 
 _DOW_NAMES = {
-    "sun": 0,
+    "sun": 7,
     "mon": 1,
     "tue": 2,
     "wed": 3,
