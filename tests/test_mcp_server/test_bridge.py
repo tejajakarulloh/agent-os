@@ -342,8 +342,19 @@ async def test_transcript_jsonl_clamps_limit_through_messages_read() -> None:
     ]
 
 
+# A monotonic reading for which ``(t + 300.0) - t`` rounds to slightly MORE
+# than 300.0. Real clocks land on values like this routinely; pinning one makes
+# the rounding deterministic instead of a rare CI failure.
+_ROUNDS_UP_MONOTONIC = 16330.771337564662
+
+
 @pytest.mark.asyncio
-async def test_events_wait_clamps_effective_deadline() -> None:
+async def test_events_wait_clamps_effective_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Frozen clock: the reading is identical on both calls, which is what a
+    # coarse timer does and what makes the float rounding observable.
+    monkeypatch.setattr(bridge_module.time, "monotonic", lambda: _ROUNDS_UP_MONOTONIC)
     client = RecordingEventClient()
     bridge = AgentOSMCPBridge(gateway_client_factory=lambda: client)
 
@@ -353,6 +364,8 @@ async def test_events_wait_clamps_effective_deadline() -> None:
     first_timeout = client.recv_timeouts[0]
     assert first_timeout is not None
     # The deadline must come from the clamped timeout, not the requested hour.
+    # Exact, not approximate: with this clock the unclamped subtraction yields
+    # 300.0000000000018, so a tolerance here would hide the defect.
     assert first_timeout <= bridge_module._MAX_EVENTS_WAIT_TIMEOUT_MS / 1000
 
 

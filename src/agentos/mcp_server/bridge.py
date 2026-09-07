@@ -157,10 +157,17 @@ class AgentOSMCPBridge:
             )
             max_events = _clamp_limit(max_events, _MAX_EVENTS_WAIT_EVENTS)
             timeout_ms = min(max(0, timeout_ms), _MAX_EVENTS_WAIT_TIMEOUT_MS)
-            deadline = time.monotonic() + timeout_ms / 1000
+            budget_s = timeout_ms / 1000
+            deadline = time.monotonic() + budget_s
 
             while len(events) < max_events:
-                remaining = deadline - time.monotonic()
+                # Cap against the budget as well as the deadline. Adding
+                # budget_s to a large monotonic reading rounds up, so
+                # ``deadline - now`` can exceed the budget by a few
+                # picoseconds when the clock has not ticked between the two
+                # readings -- routine on a coarse timer. Harmless to wait on,
+                # but it means the clamp does not actually hold.
+                remaining = min(deadline - time.monotonic(), budget_s)
                 if remaining <= 0:
                     break
                 try:
