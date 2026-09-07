@@ -21,8 +21,18 @@ from openpyxl import load_workbook
 
 
 def _coerce(value: Any, as_text: bool) -> Any:
-    if as_text and isinstance(value, str) and value.startswith("="):
-        return "'" + value
+    """Return the value to assign, honouring an explicit ``as_text`` request.
+
+    ``as_text`` means "store exactly what I passed", so it suppresses the
+    ISO-8601 coercion below as well as the formula interpretation. The cell
+    *type* is what carries the distinction and that needs the cell object, so
+    :func:`apply_ops` applies it after assignment; nothing is prepended to the
+    data here. Excel's leading apostrophe is an input-mode escape rather than
+    content, and writing it into the string left the cell holding ``'=hello``
+    where the caller asked for ``=hello``.
+    """
+    if as_text:
+        return value
     if isinstance(value, str) and len(value) >= 19 and value[10] == "T":
         try:
             return datetime.fromisoformat(value)
@@ -45,7 +55,18 @@ def apply_ops(wb: Any, ops: list[dict[str, Any]]) -> int:
             if sheet_name not in wb.sheetnames or row is None or col is None:
                 continue
             ws = wb[sheet_name]
-            ws.cell(row=int(row), column=int(col), value=_coerce(value, bool(op.get("as_text"))))
+            as_text = bool(op.get("as_text"))
+            coerced = _coerce(value, as_text)
+            cell = ws.cell(row=int(row), column=int(col), value=coerced)
+            if as_text and isinstance(coerced, str):
+                # Assigning a string that starts with ``=`` makes openpyxl mark
+                # the cell as a formula, so the string type has to be restored
+                # afterwards. ``quotePrefix`` is the stored form of Excel's
+                # apostrophe escape, which is why it belongs on the style and
+                # not in the value.
+                cell.data_type = "s"
+                if coerced.startswith("="):
+                    cell.quotePrefix = True
             applied += 1
         elif kind == "rename_sheet":
             old = op.get("old")
