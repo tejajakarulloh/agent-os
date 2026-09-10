@@ -259,14 +259,27 @@ async def _drain_task_runtime_for_session(
 
     try:
         rows = await task_runtime.list(session_key=session_key)
+        # One slow task must not strand the others: the timeout is per task,
+        # matching the settle loop above. A shared outer ``except`` aborted the
+        # whole loop on the first timeout, so reset/delete went on to touch
+        # session storage while later tasks were still running against it.
+        undrained = 0
         for row in rows:
-            if _task_status_value(getattr(row, "status", None)) in _ACTIVE_TASK_STATUSES:
+            if _task_status_value(getattr(row, "status", None)) not in _ACTIVE_TASK_STATUSES:
+                continue
+            try:
                 await asyncio.wait_for(
                     task_runtime.wait(row.task_id),
                     timeout=_RESET_RUNTIME_CANCEL_DRAIN_SECONDS,
                 )
-    except TimeoutError:
-        log.warning(f"sessions.{op}.task_runtime_drain_timeout", session_key=session_key)
+            except TimeoutError:
+                undrained += 1
+        if undrained:
+            log.warning(
+                f"sessions.{op}.task_runtime_drain_timeout",
+                session_key=session_key,
+                undrained_tasks=undrained,
+            )
     except Exception:
         log.warning(f"sessions.{op}.task_runtime_drain_failed", session_key=session_key)
 
