@@ -117,11 +117,16 @@ def main() -> int:
             continue
         by_id[str(identifier)] = item
 
-    fresh = select_new(args.name, list(by_id), first_run_reports=args.first_run_reports)
+    fresh = select_new(
+        args.name,
+        list(by_id),
+        first_run_reports=args.first_run_reports,
+        limit=args.limit,
+    )
     if not fresh:
         return 0
 
-    for identifier in fresh[: args.limit]:
+    for identifier in fresh:
         print(f"- {_summarize(by_id[identifier], args.field)}")
     return 0
 

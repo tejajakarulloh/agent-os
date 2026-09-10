@@ -302,3 +302,109 @@ def test_github_rejects_an_unknown_scope(state_dir):
     result = _run("watch_github.py", "--repo", "o/n", "--scope", "stars", env_home=state_dir)
 
     assert result.returncode == 2  # argparse rejects the choice
+
+
+# ── --limit caps a run, not the backlog (Issue #1674) ───────────────────────
+
+
+def _rss_with(count: int, offset: int = 0) -> str:
+    items = "".join(
+        f"<item><title>Post {n}</title><link>https://example.com/{n}</link><guid>{n}</guid></item>"
+        for n in range(offset, offset + count)
+    )
+    return f'<?xml version="1.0"?><rss><channel>{items}</channel></rss>'
+
+
+def test_rss_reports_the_surplus_on_the_next_run(state_dir, base_url):
+    """More new items than ``--limit`` must not be consumed unreported.
+
+    The watermark used to record every fresh id and the caller then printed
+    only the first ``--limit`` of them, so a feed that published more than the
+    cap between two runs lost the difference for good.
+    """
+    url = _feed(state_dir, base_url, "feed.xml", _rss_with(1))
+    _run("watch_rss.py", "--url", url, "--name", "t", env_home=state_dir)  # adopt silently
+
+    _feed(state_dir, base_url, "feed.xml", _rss_with(6))  # 5 new items, cap of 2
+    first = _run("watch_rss.py", "--url", url, "--name", "t", "--limit", "2", env_home=state_dir)
+    assert first.returncode == 0
+    assert first.stdout.count("Post ") == 2
+
+    reported = first.stdout
+    for _ in range(3):
+        nxt = _run("watch_rss.py", "--url", url, "--name", "t", "--limit", "2", env_home=state_dir)
+        assert nxt.returncode == 0
+        reported += nxt.stdout
+
+    # Every one of the five new posts is reported, each exactly once.
+    for n in range(1, 6):
+        assert reported.count(f"Post {n}\n") == 1, f"Post {n} in {reported!r}"
+
+    # And once the backlog is drained the watcher goes quiet again.
+    assert _run("watch_rss.py", "--url", url, "--name", "t", env_home=state_dir).stdout == ""
+
+
+def test_json_reports_the_surplus_on_the_next_run(state_dir, base_url):
+    args = ("--name", "j", "--id-field", "event_id", "--items-path", "data.events")
+    url = _events(state_dir, base_url, [{"event_id": "seed", "title": "Seed"}])
+    _run("watch_http_json.py", "--url", url, *args, env_home=state_dir)
+
+    _events(
+        state_dir,
+        base_url,
+        [{"event_id": f"e{n}", "title": f"Event {n}"} for n in range(4)],
+    )
+    first = _run("watch_http_json.py", "--url", url, *args, "--limit", "1", env_home=state_dir)
+    assert first.stdout.count("Event ") == 1
+
+    reported = first.stdout
+    for _ in range(3):
+        reported += _run(
+            "watch_http_json.py", "--url", url, *args, "--limit", "1", env_home=state_dir
+        ).stdout
+
+    for n in range(4):
+        assert reported.count(f"Event {n}\n") == 1, f"Event {n} in {reported!r}"
+
+
+def test_a_capped_run_records_only_what_it_reported(state_dir):
+    """The watermark itself, not just the printed lines.
+
+    ``select_new`` is the shared helper all three watchers commit through, so
+    assert on the stored state directly: an id that was held back must not be
+    in the file.
+    """
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        import _watermark  # type: ignore[import-not-found]
+    finally:
+        sys.path.pop(0)
+
+    # ``state_dir`` already points AGENTOS_STATE_DIR at this test's tmp_path.
+    ids = [f"item-{n:02d}" for n in range(6)]
+
+    _watermark.select_new("cap", ids[:1])  # first run adopts silently
+    assert _watermark.load_seen("cap") == ["item-00"]
+
+    assert _watermark.select_new("cap", ids, limit=2) == ["item-01", "item-02"]
+    assert _watermark.load_seen("cap") == ["item-00", "item-01", "item-02"]
+
+    assert _watermark.select_new("cap", ids, limit=2) == ["item-03", "item-04"]
+    assert _watermark.select_new("cap", ids, limit=2) == ["item-05"]
+    assert _watermark.select_new("cap", ids, limit=2) == []
+    assert _watermark.load_seen("cap") == ids
+
+
+def test_the_first_run_adopts_the_whole_feed_despite_a_low_limit(state_dir, base_url):
+    """The silent first run stays uncapped.
+
+    Capping it would leave the rest of the page to arrive as "new" on the next
+    run — exactly the dump the silent first run exists to prevent.
+    """
+    url = _feed(state_dir, base_url, "feed.xml", _rss_with(5))
+
+    first = _run("watch_rss.py", "--url", url, "--name", "t", "--limit", "1", env_home=state_dir)
+    assert first.stdout == ""
+
+    second = _run("watch_rss.py", "--url", url, "--name", "t", "--limit", "1", env_home=state_dir)
+    assert second.stdout == "", "the adopted feed must not resurface as new"

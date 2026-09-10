@@ -94,11 +94,16 @@ def main() -> int:
 
     entries = _entries(root)
     by_id = {entry[0]: entry for entry in entries}
-    fresh = select_new(args.name, list(by_id), first_run_reports=args.first_run_reports)
+    fresh = select_new(
+        args.name,
+        list(by_id),
+        first_run_reports=args.first_run_reports,
+        limit=args.limit,
+    )
     if not fresh:
         return 0
 
-    for guid in fresh[: args.limit]:
+    for guid in fresh:
         _, title, link = by_id[guid]
         print(f"- {title or guid}" + (f"\n  {link}" if link else ""))
     return 0

@@ -35,7 +35,9 @@ which is exactly the contract a cron `script` job wants.
 
 All three also take `--limit` (max lines per run, default 10) and
 `--first-run-reports` (report everything on the first run instead of starting
-quiet).
+quiet). `--limit` caps one run, not the backlog: when a feed publishes more
+new items than the cap, the surplus is held back and reported by the following
+runs rather than being skipped.
 
 `--url` must be `http://` or `https://`. Any other scheme is refused with exit
 code 1 — `urlopen` speaks `file:`, `ftp:` and `data:` too, and a watcher

@@ -110,11 +110,16 @@ def main() -> int:
         if identifier:
             lines[identifier] = line
 
-    fresh = select_new(watermark, list(lines), first_run_reports=args.first_run_reports)
+    fresh = select_new(
+        watermark,
+        list(lines),
+        first_run_reports=args.first_run_reports,
+        limit=args.limit,
+    )
     if not fresh:
         return 0
 
-    for identifier in fresh[: args.limit]:
+    for identifier in fresh:
         print(lines[identifier])
     return 0
 

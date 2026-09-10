@@ -53,17 +53,36 @@ def save_seen(name: str, ids: list[str]) -> None:
     tmp.replace(path)
 
 
-def select_new(name: str, ids: list[str], *, first_run_reports: bool = False) -> list[str]:
+def select_new(
+    name: str,
+    ids: list[str],
+    *,
+    first_run_reports: bool = False,
+    limit: int | None = None,
+) -> list[str]:
     """Return the ids not seen before and record them.
 
     The first run reports nothing by default: a watcher that has never run has
     no idea which of the 50 items on the page are actually new, and dumping all
     of them into a chat is the wrong first impression.
+
+    ``limit`` caps how many ids one run hands back. Only the ids actually
+    returned are committed, so a burst bigger than the cap is reported over the
+    following runs instead of being marked seen without ever being printed.
+    Recording all of them and then slicing at the caller is what made a feed
+    with more than ``--limit`` new items lose the surplus for good.
+
+    The first-run adoption stays uncapped: it is recording the feed's current
+    state rather than reporting it, so capping it would leave the rest of the
+    page to arrive as "new" on the next run — the dump the silent first run
+    exists to prevent.
     """
     seen = set(load_seen(name))
     is_first_run = not seen
     fresh = [item for item in ids if item not in seen]
-    save_seen(name, [*load_seen(name), *fresh])
     if is_first_run and not first_run_reports:
+        save_seen(name, [*load_seen(name), *fresh])
         return []
-    return fresh
+    reported = fresh if limit is None else fresh[: max(0, limit)]
+    save_seen(name, [*load_seen(name), *reported])
+    return reported
