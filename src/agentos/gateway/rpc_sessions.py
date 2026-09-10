@@ -853,7 +853,10 @@ async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
     if not isinstance(params, dict):
         params = {}
     agent_id = normalize_agent_id(params.get("agentId", "main"))
-    display_name = params.get("displayName")
+    # Funnel through the same normalizer sessions.rename/sessions.patch use,
+    # so a session created with a multi-line or oversized title can't store a
+    # shape those other write paths would never allow.
+    display_name = normalize_session_name(params.get("displayName"))
     message = params.get("message")
     model = _model_value(params.get("model")) or _agent_registry_model(ctx, agent_id)
     kind = params.get("kind") or params.get("sessionKind")

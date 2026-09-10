@@ -639,6 +639,72 @@ class TestSessionsCreate:
 
         assert res.ok is True
 
+    @pytest.mark.asyncio
+    async def test_create_collapses_multiline_display_name_like_rename_does(self, dispatcher):
+        session_manager = FakeSessionManager()
+        ctx = make_ctx(session_manager=session_manager)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {"agentId": "myagent", "displayName": "Line one\nLine two\ttabbed"},
+            ctx,
+        )
+
+        assert res.ok is True
+        stored = session_manager._storage._sessions[res.payload["key"]]
+        assert stored.display_name == "Line one Line two tabbed"
+
+    @pytest.mark.asyncio
+    async def test_create_truncates_display_name_to_max_session_name_length(self, dispatcher):
+        session_manager = FakeSessionManager()
+        ctx = make_ctx(session_manager=session_manager)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {"agentId": "myagent", "displayName": "x" * 500},
+            ctx,
+        )
+
+        assert res.ok is True
+        stored = session_manager._storage._sessions[res.payload["key"]]
+        assert stored.display_name == "x" * 120
+
+    @pytest.mark.asyncio
+    async def test_create_drops_control_bytes_from_display_name(self, dispatcher):
+        session_manager = FakeSessionManager()
+        ctx = make_ctx(session_manager=session_manager)
+        evil = "Innocent\x1b[2J\x1b[HHACKED"
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {"agentId": "myagent", "displayName": evil},
+            ctx,
+        )
+
+        assert res.ok is True
+        stored = session_manager._storage._sessions[res.payload["key"]]
+        assert "\x1b" not in stored.display_name
+        assert stored.display_name == "Innocent[2J[HHACKED"
+
+    @pytest.mark.asyncio
+    async def test_create_blank_display_name_normalizes_to_none(self, dispatcher):
+        session_manager = FakeSessionManager()
+        ctx = make_ctx(session_manager=session_manager)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.create",
+            {"agentId": "myagent", "displayName": "   \n\t  "},
+            ctx,
+        )
+
+        assert res.ok is True
+        stored = session_manager._storage._sessions[res.payload["key"]]
+        assert stored.display_name is None
+
 
 class TestSessionsList:
     @pytest.mark.asyncio
