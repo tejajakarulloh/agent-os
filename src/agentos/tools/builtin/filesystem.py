@@ -1048,8 +1048,12 @@ async def grep_search(
                     continue
                 if not fp.is_file():
                     continue
-                if include and not fnmatch.fnmatch(fp.name, include):
-                    continue
+                if include:
+                    rel_include = fp.relative_to(base).as_posix()
+                    if not fnmatch.fnmatch(fp.name, include) and not fnmatch.fnmatch(
+                        rel_include, include
+                    ):
+                        continue
                 search_file(fp)
 
         return results
