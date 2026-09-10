@@ -41,6 +41,62 @@ def test_nullable_union_collapses_to_the_concrete_branch() -> None:
     assert "collapsed_nullable_union" in fixes
 
 
+def test_nullable_union_collapses_when_null_branch_uses_a_type_list() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "filter": {"anyOf": [{"type": "string"}, {"type": ["null"]}]},
+        },
+    }
+
+    cleaned, fixes = sanitize_input_schema(schema)
+
+    assert cleaned["properties"]["filter"] == {"type": "string"}
+    assert "collapsed_nullable_union" in fixes
+
+
+def test_nullable_union_collapses_when_null_branch_has_type_none() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "filter": {"anyOf": [{"type": "string"}, {"type": None}]},
+        },
+    }
+
+    cleaned, fixes = sanitize_input_schema(schema)
+
+    assert cleaned["properties"]["filter"] == {"type": "string"}
+    assert "collapsed_nullable_union" in fixes
+
+
+def test_nullable_union_collapses_when_null_branch_is_a_const_null() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "filter": {"anyOf": [{"type": "string"}, {"const": None}]},
+        },
+    }
+
+    cleaned, fixes = sanitize_input_schema(schema)
+
+    assert cleaned["properties"]["filter"] == {"type": "string"}
+    assert "collapsed_nullable_union" in fixes
+
+
+def test_nullable_union_collapses_when_null_branch_is_an_enum_of_null() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "filter": {"anyOf": [{"type": "string"}, {"enum": [None]}]},
+        },
+    }
+
+    cleaned, fixes = sanitize_input_schema(schema)
+
+    assert cleaned["properties"]["filter"] == {"type": "string"}
+    assert "collapsed_nullable_union" in fixes
+
+
 def test_union_with_two_real_branches_is_left_alone() -> None:
     schema = {
         "type": "object",

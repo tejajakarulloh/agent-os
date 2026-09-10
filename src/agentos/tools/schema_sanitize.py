@@ -46,7 +46,19 @@ _SCHEMA_LIST_KEYS = ("allOf", "anyOf", "oneOf", "prefixItems")
 
 
 def _is_null_schema(node: Any) -> bool:
-    return isinstance(node, Mapping) and node.get("type") == "null"
+    if not isinstance(node, Mapping):
+        return False
+    if "type" in node:
+        node_type = node["type"]
+        if node_type is None or node_type == "null":
+            return True
+        if isinstance(node_type, list) and node_type and all(t == "null" for t in node_type):
+            return True
+    if "const" in node and node["const"] is None:
+        return True
+    if node.get("enum") == [None]:
+        return True
+    return False
 
 
 def _collect_defs(schema: Mapping[str, Any]) -> dict[str, Any]:
