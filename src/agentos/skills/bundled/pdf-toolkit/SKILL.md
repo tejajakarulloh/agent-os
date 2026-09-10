@@ -76,7 +76,22 @@ Output:
 Text uses `pdfplumber` (already in default dependencies) which preserves
 column layout better than naive PDF text extraction. Tables use
 `pdfplumber.extract_tables()` with default settings; for tricky layouts
-pass `--tables-strategy lines|text|explicit` to switch detection mode.
+pass `--tables-strategy lines|text|explicit` to switch detection mode. The
+strategy applies to both axes:
+
+| Strategy | Finds rows and columns from | Use when |
+|---|---|---|
+| `lines` (default) | ruling lines drawn in the PDF | the table has visible borders |
+| `text` | the alignment of the words themselves | the table is borderless |
+| `explicit` | coordinates you supply | detection fails and you know the edges |
+
+`explicit` needs both edge lists, or the run stops with an error:
+
+```bash
+python {baseDir}/scripts/extract.py doc.pdf --tables-strategy explicit \
+  --explicit-vertical-lines "270,315,360" \
+  --explicit-horizontal-lines "78,96,114,132"
+```
 
 For OCR (scanned PDFs), this skill does not include Tesseract — use the
 sibling skill that wraps an OCR engine (out of scope here).

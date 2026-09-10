@@ -12,7 +12,62 @@ import pdfplumber
 from pypdf import PdfReader
 
 
-def extract(path: Path, tables_strategy: str | None) -> dict[str, Any]:
+def parse_coordinates(raw: str | None, label: str) -> list[float]:
+    """Parse a comma-separated list of page coordinates for the explicit strategy."""
+    if not raw:
+        return []
+    values: list[float] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            values.append(float(token))
+        except ValueError as exc:
+            raise ValueError(f"{label} expects numbers, got {token!r}") from exc
+    return values
+
+
+def build_table_settings(
+    tables_strategy: str | None,
+    vertical_lines: list[float] | None = None,
+    horizontal_lines: list[float] | None = None,
+) -> dict[str, Any]:
+    """Return the pdfplumber table settings for *tables_strategy*.
+
+    A strategy names how to find the edges of a table, and pdfplumber asks for
+    it once per axis. Setting only ``vertical_strategy`` left the horizontal
+    axis on its ``"lines"`` default, so ``--tables-strategy text`` still needed
+    ruling lines to find its rows and returned nothing on exactly the
+    borderless tables it exists to read.
+
+    ``explicit`` additionally reads the edge positions out of
+    ``explicit_vertical_lines`` / ``explicit_horizontal_lines``; with neither
+    key present pdfplumber dereferences ``None`` and raises ``TypeError`` from
+    inside ``get_edges()``, so the caller has to supply them.
+    """
+    strategy = tables_strategy or "lines"
+    settings: dict[str, Any] = {
+        "vertical_strategy": strategy,
+        "horizontal_strategy": strategy,
+    }
+    if strategy == "explicit":
+        if not vertical_lines or not horizontal_lines:
+            raise ValueError(
+                "--tables-strategy explicit needs both --explicit-vertical-lines and "
+                "--explicit-horizontal-lines (comma-separated page coordinates)"
+            )
+        settings["explicit_vertical_lines"] = list(vertical_lines)
+        settings["explicit_horizontal_lines"] = list(horizontal_lines)
+    return settings
+
+
+def extract(
+    path: Path,
+    tables_strategy: str | None,
+    vertical_lines: list[float] | None = None,
+    horizontal_lines: list[float] | None = None,
+) -> dict[str, Any]:
     reader = PdfReader(str(path))
     metadata: dict[str, Any] = {}
     if reader.metadata is not None:
@@ -21,7 +76,7 @@ def extract(path: Path, tables_strategy: str | None) -> dict[str, Any]:
 
     pages_text: list[dict[str, Any]] = []
     tables: list[dict[str, Any]] = []
-    table_settings = {"vertical_strategy": tables_strategy or "lines"}
+    table_settings = build_table_settings(tables_strategy, vertical_lines, horizontal_lines)
     with pdfplumber.open(str(path)) as pdf:
         for idx, page in enumerate(pdf.pages, start=1):
             content = page.extract_text() or ""
@@ -44,7 +99,17 @@ def _parse_args() -> argparse.Namespace:
         "--tables-strategy",
         choices=("lines", "text", "explicit"),
         default=None,
-        help="pdfplumber table-detection strategy",
+        help="pdfplumber table-detection strategy, applied to both axes",
+    )
+    parser.add_argument(
+        "--explicit-vertical-lines",
+        default=None,
+        help="Comma-separated x coordinates of the column edges, for --tables-strategy explicit",
+    )
+    parser.add_argument(
+        "--explicit-horizontal-lines",
+        default=None,
+        help="Comma-separated y coordinates of the row edges, for --tables-strategy explicit",
     )
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--json", action="store_true", help="Force JSON output (default)")
@@ -56,7 +121,15 @@ def main() -> int:
     if not args.path.is_file():
         print(f"error: {args.path} not found", file=sys.stderr)
         return 2
-    payload = extract(args.path, args.tables_strategy)
+    try:
+        vertical = parse_coordinates(args.explicit_vertical_lines, "--explicit-vertical-lines")
+        horizontal = parse_coordinates(
+            args.explicit_horizontal_lines, "--explicit-horizontal-lines"
+        )
+        payload = extract(args.path, args.tables_strategy, vertical, horizontal)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
