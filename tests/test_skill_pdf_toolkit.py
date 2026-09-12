@@ -199,3 +199,136 @@ def test_tables_strategy_explicit_is_rejected_with_a_clear_message(
         extract.main()
     assert exc_info.value.code == 2
     assert "invalid choice: 'explicit'" in capsys.readouterr().err
+
+
+def _form_fill_module():
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        import form_fill  # type: ignore[import-not-found]
+    finally:
+        sys.path.pop(0)
+    return form_fill
+
+
+def _make_two_field_form(path: Path) -> None:
+    """An AcroForm with two empty `/Tx` fields — what form_fill.py is pointed at."""
+    from reportlab.pdfgen import canvas
+
+    c = canvas.Canvas(str(path))
+    c.drawString(72, 760, "Application")
+    c.acroForm.textfield(name="full_name", x=72, y=700, width=200, height=20)
+    c.acroForm.textfield(name="city", x=72, y=660, width=200, height=20)
+    c.showPage()
+    c.save()
+
+
+def _field_values(path: Path) -> dict[str, str]:
+    from pypdf import PdfReader
+
+    fields = PdfReader(str(path)).get_fields() or {}
+    return {name: (field.get("/V") or "") for name, field in fields.items()}
+
+
+def test_form_fill_fills_every_field_from_a_json_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The path that must keep working — the guard below must not narrow it."""
+    form_fill = _form_fill_module()
+    form = tmp_path / "form.pdf"
+    _make_two_field_form(form)
+    data = tmp_path / "data.json"
+    data.write_text('{"full_name": "Ada", "city": "Jakarta"}', encoding="utf-8")
+    out = tmp_path / "filled.pdf"
+
+    monkeypatch.setattr(
+        "sys.argv", ["form_fill.py", str(form), str(data), "--out", str(out)]
+    )
+    assert form_fill.main() == 0
+    assert _field_values(out) == {"full_name": "Ada", "city": "Jakarta"}
+    assert '"fields": 2' in capsys.readouterr().out
+
+
+def test_form_fill_accepts_an_empty_object_as_nothing_to_fill(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`{}` is a usable mapping that happens to be empty, not a bad data file."""
+    form_fill = _form_fill_module()
+    form = tmp_path / "form.pdf"
+    _make_two_field_form(form)
+    data = tmp_path / "data.json"
+    data.write_text("{}", encoding="utf-8")
+    out = tmp_path / "filled.pdf"
+
+    monkeypatch.setattr(
+        "sys.argv", ["form_fill.py", str(form), str(data), "--out", str(out)]
+    )
+    assert form_fill.main() == 0
+    assert out.is_file()
+
+
+@pytest.mark.parametrize(
+    ("payload", "kind"),
+    [
+        ('["full_name", "Ada"]', "list"),
+        ('[{"full_name": "Ada"}]', "list"),
+        ('"full_name=Ada"', "str"),
+        ("42", "int"),
+        ("null", "NoneType"),
+        ("true", "bool"),
+    ],
+)
+def test_form_fill_refuses_a_data_file_that_is_not_an_object(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: str,
+    kind: str,
+) -> None:
+    """Coercing these to {} wrote a blank form and exited 0."""
+    form_fill = _form_fill_module()
+    form = tmp_path / "form.pdf"
+    _make_two_field_form(form)
+    data = tmp_path / "data.json"
+    data.write_text(payload, encoding="utf-8")
+    out = tmp_path / "filled.pdf"
+
+    monkeypatch.setattr(
+        "sys.argv", ["form_fill.py", str(form), str(data), "--out", str(out)]
+    )
+    assert form_fill.main() == 2
+    assert not out.exists(), "a refused fill must not leave an output PDF behind"
+    err = capsys.readouterr().err
+    assert "must be a JSON object" in err
+    assert kind in err
+
+
+def test_form_fill_refuses_a_data_file_that_is_not_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same unusable-data-file path, reached one step earlier."""
+    form_fill = _form_fill_module()
+    form = tmp_path / "form.pdf"
+    _make_two_field_form(form)
+    data = tmp_path / "data.json"
+    data.write_text("full_name: Ada\n", encoding="utf-8")
+    out = tmp_path / "filled.pdf"
+
+    monkeypatch.setattr(
+        "sys.argv", ["form_fill.py", str(form), str(data), "--out", str(out)]
+    )
+    assert form_fill.main() == 2
+    assert not out.exists()
+    assert "not valid JSON" in capsys.readouterr().err
+
+
+def test_form_fill_list_fields_still_needs_no_data_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--list-fields returns before the data file is read at all."""
+    form_fill = _form_fill_module()
+    form = tmp_path / "form.pdf"
+    _make_two_field_form(form)
+
+    monkeypatch.setattr("sys.argv", ["form_fill.py", str(form), "--list-fields"])
+    assert form_fill.main() == 0
+    assert "full_name" in capsys.readouterr().out

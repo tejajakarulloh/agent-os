@@ -69,8 +69,22 @@ def main() -> int:
     if not args.data.is_file():
         print(f"error: data {args.data} not found", file=sys.stderr)
         return 2
-    raw = json.loads(args.data.read_text(encoding="utf-8"))
-    data = {str(k): str(v) for k, v in (raw.items() if isinstance(raw, dict) else [])}
+    try:
+        raw = json.loads(args.data.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"error: data {args.data} is not valid JSON: {exc}", file=sys.stderr)
+        return 2
+    # A data file this script cannot use is refused like every other bad
+    # input. Coercing a non-object to {} filled nothing and still wrote the
+    # output PDF, so a blank form left here reported as a successful fill.
+    if not isinstance(raw, dict):
+        print(
+            f"error: data {args.data} must be a JSON object of field -> value, "
+            f"got {type(raw).__name__}",
+            file=sys.stderr,
+        )
+        return 2
+    data = {str(k): str(v) for k, v in raw.items()}
     pages = fill(args.input, data, args.out)
     print(json.dumps({"pages_processed": pages, "fields": len(data)}, ensure_ascii=False))
     return 0
