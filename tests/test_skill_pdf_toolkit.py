@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -71,7 +72,9 @@ def test_merge_split_extract_round_trip(tmp_path: Path) -> None:
 
     out_dir = tmp_path / "split_out"
     parts = split.split(combined, "1,2", out_dir)
-    assert len(parts) == 2
+    assert len(parts.files) == 2
+    assert parts.pages == [[1], [2]]
+    assert parts.pages_out_of_range == []
 
     payload = extract.extract(combined, tables_strategy=None)
     assert payload["pages"] == 2
@@ -199,3 +202,144 @@ def test_tables_strategy_explicit_is_rejected_with_a_clear_message(
         extract.main()
     assert exc_info.value.code == 2
     assert "invalid choice: 'explicit'" in capsys.readouterr().err
+
+
+def _split_module():
+    sys.path.insert(0, str(SCRIPTS))
+    try:
+        import split  # type: ignore[import-not-found]
+    finally:
+        sys.path.pop(0)
+    return split
+
+
+def _make_n_page_pdf(path: Path, pages: int) -> None:
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.pdfgen import canvas
+
+    c = canvas.Canvas(str(path), pagesize=LETTER)
+    for page in range(1, pages + 1):
+        c.setFont("Helvetica", 14)
+        c.drawString(72, 720, f"PAGE {page}")
+        c.showPage()
+    c.save()
+
+
+def _page_count(path: Path) -> int:
+    from pypdf import PdfReader
+
+    return len(PdfReader(str(path)).pages)
+
+
+def test_split_reports_the_pages_each_output_actually_holds(tmp_path: Path) -> None:
+    """A range inside the document is unchanged, and now says what it wrote."""
+    split = _split_module()
+    src = tmp_path / "five.pdf"
+    _make_n_page_pdf(src, 5)
+
+    result = split.split(src, "1-3,5", tmp_path / "out")
+    assert [p.name for p in result.files] == ["five_001.pdf", "five_002.pdf"]
+    assert result.pages == [[1, 2, 3], [5]]
+    assert result.total_pages == 5
+    assert result.pages_out_of_range == []
+    assert [_page_count(p) for p in result.files] == [3, 1]
+
+
+def test_split_names_the_pages_an_overrunning_range_could_not_honour(
+    tmp_path: Path,
+) -> None:
+    """`3-7` on a 5-page document wrote a 3-page file and said nothing."""
+    split = _split_module()
+    src = tmp_path / "five.pdf"
+    _make_n_page_pdf(src, 5)
+
+    result = split.split(src, "3-7", tmp_path / "out")
+    assert len(result.files) == 1
+    assert _page_count(result.files[0]) == 3
+    assert result.pages == [[3, 4, 5]]
+    assert result.pages_out_of_range == [6, 7]
+
+
+def test_split_collects_out_of_range_pages_across_every_group(tmp_path: Path) -> None:
+    """Each range contributes its own rejects, in the order they were asked for."""
+    split = _split_module()
+    src = tmp_path / "five.pdf"
+    _make_n_page_pdf(src, 5)
+
+    result = split.split(src, "4-6,1-2,9", tmp_path / "out")
+    assert result.pages == [[4, 5], [1, 2]]
+    assert result.pages_out_of_range == [6, 9]
+
+
+def test_split_reports_a_page_below_the_first_as_out_of_range(tmp_path: Path) -> None:
+    """The other end of the clamp: page 0 is not a page either."""
+    split = _split_module()
+    src = tmp_path / "five.pdf"
+    _make_n_page_pdf(src, 5)
+
+    result = split.split(src, "0-2", tmp_path / "out")
+    assert result.pages == [[1, 2]]
+    assert result.pages_out_of_range == [0]
+
+
+def test_split_exits_non_zero_when_no_requested_page_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`7-9` on a 5-page document wrote nothing and exited 0."""
+    split = _split_module()
+    src = tmp_path / "five.pdf"
+    _make_n_page_pdf(src, 5)
+    out_dir = tmp_path / "out"
+
+    monkeypatch.setattr(
+        "sys.argv", ["split.py", str(src), "--pages", "7-9", "--out", str(out_dir)]
+    )
+    assert split.main() == 2
+    captured = capsys.readouterr()
+    assert "nothing was written" in captured.err
+    assert "1-5" in captured.err
+    payload = json.loads(captured.out)
+    assert payload["files"] == []
+    assert payload["pages_out_of_range"] == [7, 8, 9]
+    assert payload["total_pages"] == 5
+
+
+def test_split_exits_zero_when_a_partial_range_still_produced_a_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A short file is a result, not a failure — the report is what carries it."""
+    split = _split_module()
+    src = tmp_path / "five.pdf"
+    _make_n_page_pdf(src, 5)
+    out_dir = tmp_path / "out"
+
+    monkeypatch.setattr(
+        "sys.argv", ["split.py", str(src), "--pages", "3-7", "--out", str(out_dir)]
+    )
+    assert split.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["pages"] == [[3, 4, 5]]
+    assert payload["pages_out_of_range"] == [6, 7]
+
+
+def test_split_keeps_its_existing_summary_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`files` and `count` keep their shape; the new keys are additive."""
+    split = _split_module()
+    src = tmp_path / "five.pdf"
+    _make_n_page_pdf(src, 5)
+    out_dir = tmp_path / "out"
+
+    monkeypatch.setattr(
+        "sys.argv", ["split.py", str(src), "--pages", "1-2,4", "--out", str(out_dir)]
+    )
+    assert split.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+    assert all(isinstance(name, str) for name in payload["files"])
+    assert [Path(name).name for name in payload["files"]] == [
+        "five_001.pdf",
+        "five_002.pdf",
+    ]

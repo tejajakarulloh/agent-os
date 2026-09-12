@@ -119,6 +119,18 @@ python {baseDir}/scripts/split.py input.pdf --pages "1-3,7,10-12" --out output_d
 Each range writes one output file: `output_dir/input_001.pdf`,
 `output_dir/input_002.pdf`, …
 
+Pages past the end of the document are dropped, so a range that overruns still
+writes its valid pages. The summary says which pages each file actually holds
+and which were out of range, because the file list alone cannot show it:
+
+```json
+{"files": ["output_dir/input_001.pdf"], "count": 1, "pages": [[3, 4, 5]],
+ "total_pages": 5, "pages_out_of_range": [6, 7]}
+```
+
+If no requested page exists in the document, nothing is written and the script
+exits 2.
+
 ---
 
 ## Path C: Form fill

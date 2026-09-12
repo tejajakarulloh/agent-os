@@ -11,9 +11,20 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from pypdf import PdfReader, PdfWriter
+
+
+@dataclass
+class SplitResult:
+    """What a split produced, including the pages it could not honour."""
+
+    files: list[Path] = field(default_factory=list)
+    pages: list[list[int]] = field(default_factory=list)
+    total_pages: int = 0
+    pages_out_of_range: list[int] = field(default_factory=list)
 
 
 def split_ranges(spec: str) -> list[list[int]]:
@@ -33,13 +44,23 @@ def split_ranges(spec: str) -> list[list[int]]:
     return groups
 
 
-def split(input_path: Path, pages_spec: str, out_dir: Path) -> list[Path]:
+def split(input_path: Path, pages_spec: str, out_dir: Path) -> SplitResult:
+    """Write one file per range, and report what each one actually holds.
+
+    Pages past the end of the document are dropped rather than refused, so a
+    range that overruns still yields its valid pages — but the caller cannot
+    see that from the file list alone, which is why the dropped pages and the
+    per-file page lists are part of the result.
+    """
     reader = PdfReader(str(input_path))
     total = len(reader.pages)
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
+    pages_written: list[list[int]] = []
+    dropped: list[int] = []
     for idx, group in enumerate(split_ranges(pages_spec), start=1):
         valid_pages = [p for p in group if 1 <= p <= total]
+        dropped.extend(p for p in group if not 1 <= p <= total)
         if not valid_pages:
             continue
         writer = PdfWriter()
@@ -49,7 +70,13 @@ def split(input_path: Path, pages_spec: str, out_dir: Path) -> list[Path]:
         with out_path.open("wb") as fh:
             writer.write(fh)
         written.append(out_path)
-    return written
+        pages_written.append(valid_pages)
+    return SplitResult(
+        files=written,
+        pages=pages_written,
+        total_pages=total,
+        pages_out_of_range=dropped,
+    )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -65,13 +92,26 @@ def main() -> int:
     if not args.input.is_file():
         print(f"error: input {args.input} not found", file=sys.stderr)
         return 2
-    written = split(args.input, args.pages, args.out)
+    result = split(args.input, args.pages, args.out)
     print(
         json.dumps(
-            {"files": [str(p) for p in written], "count": len(written)},
+            {
+                "files": [str(p) for p in result.files],
+                "count": len(result.files),
+                "pages": result.pages,
+                "total_pages": result.total_pages,
+                "pages_out_of_range": result.pages_out_of_range,
+            },
             ensure_ascii=False,
         )
     )
+    if not result.files:
+        print(
+            f"error: no requested page is within {args.input} "
+            f"(1-{result.total_pages}); nothing was written",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 
