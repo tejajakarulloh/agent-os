@@ -136,14 +136,58 @@ class TestNameSegments:
 
     @pytest.mark.parametrize(
         "name",
-        ["api_key", "CAP_API_KEY", "x-cap-api-key", "capApiKey", "access_token", "client_secret"],
+        [
+            "api_key",
+            "CAP_API_KEY",
+            "x-cap-api-key",
+            "capApiKey",
+            "access_token",
+            "client_secret",
+            # A qualifier that can only mean key material, in each of the
+            # three casings ``_name_segments`` normalises.
+            "signing_key",
+            "SIGNING_KEY",
+            "signingKey",
+            "x-signing-key",
+            "encryption_key",
+            "ENCRYPTION_KEY",
+            "encryptionKey",
+            "AccountKey",
+            "account_key",
+            "STORAGE_ACCOUNT_KEY",
+        ],
     )
     def test_credential_names(self, name: str) -> None:
         assert redact._is_credential_name(name)
 
     @pytest.mark.parametrize(
         "name",
-        ["sellToken", "buyToken", "tokenAddress", "tokenId", "token_count", "session_id", "amount"],
+        [
+            "sellToken",
+            "buyToken",
+            "tokenAddress",
+            "tokenId",
+            "token_count",
+            "session_id",
+            "amount",
+            # ``key`` stays out of the strong segments precisely so these
+            # survive: masking a field name is a diff the agent cannot apply.
+            "sort_key",
+            "sortKey",
+            "cache_key",
+            "partition_key",
+            "primary_key",
+            "foreign_key",
+            "group_key",
+            "key_count",
+            # The qualifiers added for key material do not carry over to the
+            # other nouns they pair with in ordinary code.
+            "signing_algorithm",
+            "encryption_algorithm",
+            "account_id",
+            "accountName",
+            "account_balance",
+        ],
     )
     def test_ordinary_names(self, name: str) -> None:
         assert not redact._is_credential_name(name)
@@ -184,6 +228,88 @@ class TestRedaction:
         code = 'DEFAULT_API_KEY = "test-value-for-fixtures"'
         assert redact.redact_sensitive_text(code, code_file=True) == code
         assert redact.redact_sensitive_text(code, code_file=False) != code
+
+
+class TestQualifiedKeyMaterial:
+    """``<qualifier>_key`` names that only the pair list can recognise.
+
+    The value in every case is opaque: no vendor prefix, no JWT shape, no
+    userinfo. Nothing but :func:`_is_credential_name` can decide it, which is
+    what makes these the cases the pair list exists for.
+    """
+
+    OPAQUE = "9f2b7c41ae55d0e3bb84aa11"
+
+    @pytest.mark.parametrize(
+        "assignment",
+        [
+            "SIGNING_KEY={value}",
+            "ENCRYPTION_KEY={value}",
+            "AccountKey={value}",
+            '"signingKey": "{value}"',
+            "encryption-key={value}",
+        ],
+    )
+    def test_an_env_dump_masks_key_material(self, assignment: str) -> None:
+        line = assignment.format(value=self.OPAQUE)
+        out = redact.redact_terminal_output(f"{line}\nPATH=/usr/bin\n", "printenv")
+        assert self.OPAQUE not in out
+        assert "PATH=/usr/bin" in out
+
+    @pytest.mark.parametrize(
+        "assignment",
+        [
+            "SIGNING_KEY={value}",
+            "ENCRYPTION_KEY={value}",
+            "AccountKey={value}",
+        ],
+    )
+    def test_a_dotenv_read_masks_key_material(self, assignment: str) -> None:
+        """The other surface the same pair list gates: ``read_file`` on ``.env``."""
+        line = assignment.format(value=self.OPAQUE)
+        out = redact.redact_file_output(f"{line}\n", path=".env")
+        assert self.OPAQUE not in out
+
+    def test_a_signing_key_masks_like_the_secret_key_beside_it(self) -> None:
+        """The asymmetry this closes: one dump, two names of the same shape."""
+        dump = f"SECRET_KEY={self.OPAQUE}\nSIGNING_KEY={self.OPAQUE}\n"
+        out = redact.redact_terminal_output(dump, "printenv")
+        assert self.OPAQUE not in out
+        assert out.count(redact._MASK) == 2
+
+    def test_an_azure_account_key_does_not_survive_its_connection_string(self) -> None:
+        account_key = "2b8Hs9KpLmQwErTyUiOpAsDfGhJkZxCvBnM1234567890abcdefgh=="
+        out = redact.redact_terminal_output(f"AccountKey={account_key}\n", "printenv")
+        assert account_key not in out
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "sort_key=created_at_descending",
+            "partition_key=tenant_4418_shard_0007",
+            "cache_key=user_profile_v3_20260913",
+            "account_id=acct_00000000000000000000",
+        ],
+    )
+    def test_ordinary_key_fields_are_left_alone(self, line: str) -> None:
+        """Masking these breaks the edit the agent makes next."""
+        assert redact.redact_terminal_output(f"{line}\n", "printenv") == f"{line}\n"
+
+    def test_a_reference_value_is_still_a_location_not_a_secret(self) -> None:
+        """Recognising the name must not override the reference-value guard."""
+        line = "SIGNING_KEY=$SIGNING_KEY\n"
+        assert redact.redact_terminal_output(line, "printenv") == line
+
+    def test_source_code_still_skips_the_assignment_pass(self) -> None:
+        """A masked identifier is code the agent can no longer match on."""
+        code = f'DEFAULT_SIGNING_KEY = "{self.OPAQUE}"'
+        assert redact.redact_sensitive_text(code, code_file=True) == code
+        assert redact.redact_sensitive_text(code, code_file=False) != code
+
+    def test_ordinary_output_is_not_put_through_the_assignment_pass(self) -> None:
+        """Only an env dump or a credential-file read reaches this pass."""
+        line = f"SIGNING_KEY={self.OPAQUE}\n"
+        assert redact.redact_terminal_output(line, "cat settings.py") == line
 
 
 class TestTerminalOutput:

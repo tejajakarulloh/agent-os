@@ -173,6 +173,13 @@ _QUALIFIED_NAME_PAIRS: frozenset[tuple[str, str]] = frozenset(
         ("secret", "key"),
         ("session", "token"),
         ("service", "key"),
+        # Qualifiers that can only mean key material. ``key`` alone stays out
+        # for the reason above — ``sort_key`` and ``partition_key`` are field
+        # names — but nothing signs, encrypts or authenticates a storage
+        # account with a value the model is meant to read.
+        ("signing", "key"),
+        ("encryption", "key"),
+        ("account", "key"),
     }
 )
 
