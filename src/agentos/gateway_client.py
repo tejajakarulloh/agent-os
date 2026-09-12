@@ -179,6 +179,9 @@ class GatewayRPCClient:
 
     async def close(self) -> None:
         self._closing = True
+        # The listener deliberately stays quiet during an intentional close, so
+        # a pending call has no other way to learn the connection went away.
+        self._fail_pending(ConnectionError("Gateway connection closed"))
         for task in (self._heartbeat_task, self._listener_task):
             if task is None:
                 continue
@@ -231,6 +234,12 @@ class GatewayRPCClient:
         except Exception as exc:
             self._mark_connection_failed(exc)
 
+    def _fail_pending(self, err: ConnectionError) -> None:
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(err)
+        self._pending.clear()
+
     def _mark_connection_failed(self, exc: BaseException) -> ConnectionError:
         if isinstance(exc, ConnectionError):
             err = exc
@@ -240,10 +249,7 @@ class GatewayRPCClient:
             self._connection_error = err
         else:
             err = self._connection_error
-        for fut in self._pending.values():
-            if not fut.done():
-                fut.set_exception(err)
-        self._pending.clear()
+        self._fail_pending(err)
         current_task = asyncio.current_task()
         for task in (self._heartbeat_task, self._listener_task):
             if task is not None and task is not current_task and not task.done():
