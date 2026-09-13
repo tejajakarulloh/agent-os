@@ -11,6 +11,11 @@ from agentos.channels.types import IncomingMessage
 
 SLACK_STATUS_EMOJI = {"received": "white_check_mark", "running": "eyes", "failed": "x"}
 
+#: Slack errors that report the reaction is already in the state we asked for.
+#: Deliberately narrow: an error meaning the call did not happen (``ratelimited``)
+#: must still surface, so it is not in here.
+_BENIGN_SLACK_REACTION_ERRORS = frozenset({"already_reacted", "no_reaction"})
+
 class StatusReactor(Protocol):
     async def received(self, message: IncomingMessage) -> None: ...
     async def running(self, message: IncomingMessage) -> None: ...
@@ -90,7 +95,15 @@ class SlackStatusReactor(_BaseStatusReactor):
         if resp.status_code == 403: self._disable("missing_oauth_scope"); return False
         resp.raise_for_status(); data = resp.json()
         if data.get("ok"): return True
-        if data.get("error") in {"missing_scope", "not_allowed_token_type"}: self._disable("missing_oauth_scope"); return False
-        raise RuntimeError(f"Slack API error: {data.get('error')}")
+        error = data.get("error")
+        # The desired end state was already true: the emoji is on the message
+        # (Slack retries an event on timeout, so ``received`` runs twice) or it
+        # is already gone (a human removed it). Neither says anything about the
+        # bot's permissions, and treating them as fatal disabled reactions for
+        # the rest of the adapter's life -- ``_disabled`` is only ever cleared
+        # in ``__init__``.
+        if error in _BENIGN_SLACK_REACTION_ERRORS: return True
+        if error in {"missing_scope", "not_allowed_token_type"}: self._disable("missing_oauth_scope"); return False
+        raise RuntimeError(f"Slack API error: {error}")
 
 NULL_STATUS_REACTOR = NullStatusReactor()
