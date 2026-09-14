@@ -1596,12 +1596,29 @@ async def _check_exec_approval(
                 )
                 _elevate_current_call.set(True)
                 return None
+            if not entry.resolved:
+                # An operator who was still reading the command when the wait
+                # window closed has not rejected it. Collapsing that into
+                # approval_denied made the caller record a HUMAN_REJECTED
+                # denial in the ledger, which post_denial_guard then reads as
+                # a repeat-intent signal and auto-denies the honest retry with.
+                # Same third state the retry branch below already returns.
+                return {
+                    "status": "approval_pending",
+                    "approval_id": approval_id,
+                    "command": command,
+                    "warning": warning,
+                    "message": (
+                        "Approval is still pending after waiting "
+                        f"{int(_APPROVAL_RETRY_WAIT_SECONDS)}s. Ask the user to approve."
+                    ),
+                }
             return {
                 "status": "approval_denied",
                 "approval_id": approval_id,
                 "command": command,
                 "warning": warning,
-                "message": "Approval was denied or timed out.",
+                "message": "Approval was denied.",
             }
         status = "approval_required"
         message = (
