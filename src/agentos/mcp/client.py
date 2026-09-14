@@ -12,6 +12,34 @@ from typing import Any
 from agentos.mcp.types import MCPServerConfig, MCPToolDef, MCPToolResult
 
 
+def tool_result_from_call(result: Any) -> MCPToolResult:
+    """Render one MCP ``tools/call`` result into an :class:`MCPToolResult`.
+
+    Shared by every transport so the two renderings cannot drift apart: a text
+    block contributes its text, any other block (image, embedded resource, a
+    type newer than this SDK) contributes its JSON rather than being dropped,
+    and ``structuredContent`` is the fallback when a call produced no chunks at
+    all. ``isError`` is the server's *application-level* failure flag and has to
+    survive the trip — a model handed an error as a success has no signal to
+    retry or to stop, and the tool-error path never runs.
+    """
+    chunks: list[str] = []
+    for block in getattr(result, "content", None) or []:
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            chunks.append(text)
+            continue
+        if hasattr(block, "model_dump_json"):
+            chunks.append(block.model_dump_json())
+    structured = getattr(result, "structuredContent", None)
+    if not chunks and structured is not None:
+        chunks.append(json.dumps(structured, ensure_ascii=False))
+    return MCPToolResult(
+        content="\n".join(chunks),
+        is_error=bool(getattr(result, "isError", False)),
+    )
+
+
 class MCPClient(ABC):
     """Abstract base class for MCP transport clients."""
 
@@ -189,18 +217,4 @@ class MCPSessionClient(MCPClient):
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> MCPToolResult:
         """Call a tool on the MCP server."""
         result = await self._require_session().call_tool(name, arguments)
-        chunks: list[str] = []
-        for block in result.content:
-            text = getattr(block, "text", None)
-            if isinstance(text, str):
-                chunks.append(text)
-                continue
-            if hasattr(block, "model_dump_json"):
-                chunks.append(block.model_dump_json())
-        structured = getattr(result, "structuredContent", None)
-        if not chunks and structured is not None:
-            chunks.append(json.dumps(structured, ensure_ascii=False))
-        return MCPToolResult(
-            content="\n".join(chunks),
-            is_error=bool(getattr(result, "isError", False)),
-        )
+        return tool_result_from_call(result)

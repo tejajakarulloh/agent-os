@@ -8,8 +8,44 @@ import os
 from typing import Any, cast
 
 from agentos import __version__
-from agentos.mcp.client import MCPClient
+from agentos.mcp.client import MCPClient, tool_result_from_call
 from agentos.mcp.types import MCPServerConfig, MCPToolDef, MCPToolResult
+
+
+def _tool_result_from_wire(result: dict[str, Any]) -> MCPToolResult:
+    """Render a raw JSON-RPC ``tools/call`` result the way the SDK transports do.
+
+    The payload is validated into the SDK's ``CallToolResult`` first, so stdio
+    and the session-backed transports produce the same ``MCPToolResult`` for
+    the same server payload instead of drifting apart again. A payload the
+    pinned SDK cannot model — a content block type newer than the SDK, say —
+    falls back to rendering the raw blocks: MCP content is extensible, and
+    turning an ordinary success into a *tool error* whose body is a validation
+    traceback would be worse than the data loss this fixes.
+    """
+    try:
+        from mcp.types import CallToolResult
+
+        return tool_result_from_call(CallToolResult.model_validate(result))
+    except Exception:
+        return _tool_result_from_raw(result)
+
+
+def _tool_result_from_raw(result: dict[str, Any]) -> MCPToolResult:
+    """Same rules as :func:`tool_result_from_call`, over plain wire dicts."""
+    chunks: list[str] = []
+    for block in result.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        text = block.get("text")
+        if block.get("type") == "text" and isinstance(text, str):
+            chunks.append(text)
+            continue
+        chunks.append(json.dumps(block, ensure_ascii=False))
+    structured = result.get("structuredContent")
+    if not chunks and structured is not None:
+        chunks.append(json.dumps(structured, ensure_ascii=False))
+    return MCPToolResult(content="\n".join(chunks), is_error=bool(result.get("isError", False)))
 
 
 class MCPStdioClient(MCPClient):
@@ -226,6 +262,4 @@ class MCPStdioClient(MCPClient):
             )
 
         result = response.get("result", {})
-        content_list = result.get("content", [])
-        text = "\n".join(c.get("text", "") for c in content_list if c.get("type") == "text")
-        return MCPToolResult(content=text)
+        return _tool_result_from_wire(result if isinstance(result, dict) else {})
