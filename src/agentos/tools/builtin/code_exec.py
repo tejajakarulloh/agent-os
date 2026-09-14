@@ -46,6 +46,72 @@ _DESTRUCTIVE_PY_PATTERNS: list[tuple[str, str]] = [
     ),
 ]
 
+# Windows / PowerShell spellings of the same delete intent: cmd.exe's `del`,
+# `erase` and `rd` and PowerShell's `Remove-Item` do what `rm`/`rmdir` do, and
+# on a Windows host they are the *primary* deletion vocabulary. They are
+# matched on every platform rather than behind an `os.name` guard: this check
+# runs where the code is submitted, and a Linux gateway can be driving a
+# Windows target.
+#
+# `rd` and `del` are short enough that a bare `\b` match arms the gate on
+# ordinary text (`cat order_details.txt`, `ls /mnt/rd`, `grep del file`), so
+# they are only matched in shell command position: the quote that opens the
+# command literal (or its first argv element), or straight after a `;`, `&&`
+# or `|` inside it — optionally behind an interpreter or privilege prefix
+# (`cmd /c`, `powershell -Command`, `sudo`). `rmdir` needs no new arm: the
+# POSIX patterns above already carry it. PowerShell's two-letter `ri` alias is
+# deliberately left out — it collides with Ruby's `ri` documentation browser,
+# and a two-letter alias is not worth the false positives.
+_WINDOWS_DELETE_VERBS: tuple[str, ...] = ("del", "erase", "rd", "Remove-Item")
+_SHELL_RUNNER_PREFIX = (
+    r"(?:(?:sudo|doas|nohup|env|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh)"
+    r"(?:\s+[-/][^\s'\"]+)*\s+)*"
+)
+# Command position inside Python *source* text: the opening quote of the
+# command literal or of the first argv element, or a separator inside it.
+_SOURCE_COMMAND_POSITION = r"(?:\s*\[?\s*f?['\"]\s*|[^)\n]{0,200}[;&|]\s*)" + _SHELL_RUNNER_PREFIX
+# Command position inside an already-unquoted command string.
+_CMD_COMMAND_POSITION = r"(?:^|[;&|(])\s*" + _SHELL_RUNNER_PREFIX
+_WINDOWS_DELETE_CMD_RE: re.Pattern[str] = re.compile(
+    _CMD_COMMAND_POSITION + r"(?P<verb>" + "|".join(_WINDOWS_DELETE_VERBS) + r")\b",
+    re.IGNORECASE,
+)
+# argv elements are already tokenized, so exact equality is anchor enough.
+_SHELL_DELETE_TOKENS: frozenset[str] = frozenset(
+    {"rm", "rmdir"} | {verb.lower() for verb in _WINDOWS_DELETE_VERBS}
+)
+
+_DESTRUCTIVE_PY_PATTERNS += [
+    (
+        rf"(?i)\bos\.system\s*\({_SOURCE_COMMAND_POSITION}{verb}\b",
+        f"os.system with {verb}",
+    )
+    for verb in _WINDOWS_DELETE_VERBS
+] + [
+    (
+        r"(?i)\bsubprocess\.(?:run|call|Popen|check_output|check_call)\s*\("
+        + _SOURCE_COMMAND_POSITION
+        + rf"{verb}\b",
+        f"subprocess invoking {verb}",
+    )
+    for verb in _WINDOWS_DELETE_VERBS
+]
+
+
+def _shell_delete_verb(cmd_str: str) -> str | None:
+    """The delete verb *cmd_str* invokes, or ``None``.
+
+    ``rm``/``rmdir`` keep their pre-existing loose word-boundary match and both
+    report as ``rm``, so the warning text for the POSIX verbs is unchanged.
+    The Windows verbs report themselves: the operator reading the approval
+    prompt should see the verb that was actually submitted.
+    """
+    if re.search(r"\b(rm|rmdir)\b", cmd_str):
+        return "rm"
+    match = _WINDOWS_DELETE_CMD_RE.search(cmd_str)
+    return match.group("verb").lower() if match else None
+
+
 _OS_DESTRUCTIVE_ATTRS: frozenset[str] = frozenset({"remove", "unlink", "rmdir", "removedirs"})
 _SHUTIL_DESTRUCTIVE_ATTRS: frozenset[str] = frozenset({"rmtree", "rmdir"})
 _PATH_DESTRUCTIVE_ATTRS: frozenset[str] = frozenset({"unlink", "rmdir"})
@@ -280,13 +346,19 @@ class _DestructiveCodeVisitor(ast.NodeVisitor):
 
             if mod == "os" and attr_name in ("system", "popen") and node.args:
                 cmd_str = _eval_const_str(node.args[0], frozenset(self.compile_aliases))
-                if cmd_str and re.search(r"\b(rm|rmdir)\b", cmd_str):
-                    self.warning = f"destructive Python operation detected: os.{attr_name} with rm"
+                verb = _shell_delete_verb(cmd_str) if cmd_str else None
+                if verb is not None:
+                    self.warning = (
+                        f"destructive Python operation detected: os.{attr_name} with {verb}"
+                    )
                     return
 
             if mod == "subprocess" and attr_name in _SUBPROCESS_CALL_NAMES and node.args:
-                if self._subprocess_argv_removes(node.args[0]):
-                    self.warning = "destructive Python operation detected: subprocess invoking rm"
+                verb = self._subprocess_argv_removes(node.args[0])
+                if verb is not None:
+                    self.warning = (
+                        f"destructive Python operation detected: subprocess invoking {verb}"
+                    )
                     return
 
         self.generic_visit(node)
@@ -299,21 +371,36 @@ class _DestructiveCodeVisitor(ast.NodeVisitor):
             return f"destructive Python operation detected: shutil.{attr}() via getattr"
         if module == "os" and attr in ("system", "popen") and node.args:
             cmd_str = _eval_const_str(node.args[0], frozenset(self.compile_aliases))
-            if cmd_str and re.search(r"\b(rm|rmdir)\b", cmd_str):
-                return f"destructive Python operation detected: os.{attr} with rm via getattr"
+            verb = _shell_delete_verb(cmd_str) if cmd_str else None
+            if verb is not None:
+                return f"destructive Python operation detected: os.{attr} with {verb} via getattr"
         if module == "subprocess" and attr in _SUBPROCESS_CALL_NAMES and node.args:
-            if self._subprocess_argv_removes(node.args[0]):
-                return "destructive Python operation detected: subprocess invoking rm via getattr"
+            verb = self._subprocess_argv_removes(node.args[0])
+            if verb is not None:
+                return (
+                    f"destructive Python operation detected: subprocess invoking {verb} via getattr"
+                )
         return None
 
-    def _subprocess_argv_removes(self, first_arg: ast.expr) -> bool:
-        """True when a subprocess argv (list or string form) invokes rm/rmdir."""
+    def _subprocess_argv_removes(self, first_arg: ast.expr) -> str | None:
+        """The delete verb a subprocess argv (list or string form) invokes.
+
+        ``rm``/``rmdir`` report as ``rm`` as they always have; the Windows
+        verbs report themselves. In list form every element is already its own
+        token, so exact equality is anchor enough for the short spellings.
+        """
         aliases = frozenset(self.compile_aliases)
         if isinstance(first_arg, ast.List):
             parts = [_eval_const_str(elt, aliases) for elt in first_arg.elts]
-            return any(part in ("rm", "rmdir") for part in parts if part is not None)
+            for part in parts:
+                if part is None:
+                    continue
+                token = part.strip().lower()
+                if token in _SHELL_DELETE_TOKENS:
+                    return "rm" if token in ("rm", "rmdir") else token
+            return None
         cmd_str = _eval_const_str(first_arg, aliases)
-        return bool(cmd_str and re.search(r"\b(rm|rmdir)\b", cmd_str))
+        return _shell_delete_verb(cmd_str) if cmd_str else None
 
 
 def _check_code_destructive(code: str) -> str | None:
