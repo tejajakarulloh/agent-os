@@ -241,9 +241,7 @@ def parse_iso_at(raw: str) -> datetime:
     except ValueError as exc:
         raise CronParseError(f"Invalid ISO-8601 timestamp: {raw!r}") from exc
     if dt.tzinfo is None or dt.utcoffset() is None:
-        raise CronParseError(
-            f"ISO-8601 timestamp must include a timezone offset: {raw!r}"
-        )
+        raise CronParseError(f"ISO-8601 timestamp must include a timezone offset: {raw!r}")
     return dt
 
 
@@ -251,11 +249,16 @@ def parse_cron(expr: str) -> CronExpression:
     """Parse a standard 5-field cron expression or @preset shorthand."""
     expr = expr.strip()
 
-    # Handle @presets
+    # Handle @presets. Field names are already matched case-insensitively
+    # (``MON-FRI`` and ``Mon-Fri`` both parse), so a preset spelled ``@DAILY``
+    # -- by a shell that upper-cased it, or by a person -- is the one cron
+    # spelling this parser still refused. The error keeps the caller's own
+    # spelling so an unknown preset is quoted back as it was typed.
     if expr.startswith("@"):
-        if expr not in _PRESETS:
+        preset = _PRESETS.get(expr.lower())
+        if preset is None:
             raise CronParseError(f"Unknown preset '{expr}'")
-        expr = _PRESETS[expr]
+        expr = preset
 
     fields = expr.split()
     if len(fields) != 5:
